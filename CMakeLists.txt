@@ -59,8 +59,10 @@ find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+
+# livox_ros_driver2 is optional: only required for Livox/AVIA/Mid360 lidars
+find_package(livox_ros_driver2 QUIET)
 
 set(dependencies
   rclcpp
@@ -73,8 +75,15 @@ set(dependencies
   visualization_msgs
   pcl_ros
   pcl_conversions
-  livox_ros_driver2
 )
+
+if(livox_ros_driver2_FOUND)
+  add_definitions(-DHAVE_LIVOX)
+  list(APPEND dependencies livox_ros_driver2)
+  message(STATUS "livox_ros_driver2 found: building with Livox/AVIA/Mid360 support")
+else()
+  message(STATUS "livox_ros_driver2 not found: building without Livox/AVIA/Mid360 support")
+endif()
 
 # Thirdparty libraries
 find_package(Eigen3 REQUIRED)
@@ -123,6 +132,11 @@ install(TARGETS fastlio_mapping
 install(
   DIRECTORY config launch rviz
   DESTINATION share/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/lio_map_odom_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()

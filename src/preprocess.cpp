@@ -44,11 +44,13 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
   point_filter_num = pfilt_num;
 }
 
+#ifdef HAVE_LIVOX
 void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
 {
   avia_handler(msg);
   *pcl_out = pl_surf;
 }
+#endif // HAVE_LIVOX
 
 void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
 {
@@ -81,8 +83,14 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
       velodyne_handler(msg);
       break;
 
+#ifdef HAVE_LIVOX
     case MID360:
       mid360_handler(msg);
+      break;
+#endif
+
+    case UNITREE_L2:
+      l2_handler(msg);
       break;
 
     default:
@@ -92,6 +100,7 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
   *pcl_out = pl_surf;
 }
 
+#ifdef HAVE_LIVOX
 void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg)
 {
   pl_surf.clear();
@@ -192,6 +201,7 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
     }
   }
 }
+#endif // HAVE_LIVOX
 
 void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
 {
@@ -473,6 +483,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   }
 }
 
+#ifdef HAVE_LIVOX
 void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
 {
   pl_surf.clear();
@@ -554,6 +565,44 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
       pl_surf.push_back(std::move(added_pt));
     }
   }
+}
+#endif // HAVE_LIVOX
+
+void Preprocess::l2_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<unitree_l2_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.size();
+  if (plsize == 0) return;
+  pl_surf.reserve(plsize);
+
+  for (int i = 0; i < plsize; i++)
+  {
+    if (i % point_filter_num != 0) continue;
+
+    const auto &src = pl_orig.points[i];
+
+    if (src.range < blind) continue;
+
+    PointType added_pt;
+    added_pt.x         = src.x;
+    added_pt.y         = src.y;
+    added_pt.z         = src.z;
+    added_pt.intensity = src.intensity;
+    added_pt.normal_x  = 0;
+    added_pt.normal_y  = 0;
+    added_pt.normal_z  = 0;
+    // time field is relative seconds from scan start; curvature unit is ms
+    added_pt.curvature = src.time * 1.0e3f;
+
+    pl_surf.push_back(added_pt);
+  }
+
+  given_offset_time = true;
 }
 
 void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)

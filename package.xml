@@ -25,9 +25,12 @@
   <depend>sensor_msgs</depend>
   <depend>common_interfaces</depend>
   <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>rclpy</depend>
   <depend>pcl_ros</depend>
   <depend>pcl_conversions</depend>
-  <depend>livox_ros_driver2</depend>
+  <!-- livox_ros_driver2 is optional: only needed for Livox/AVIA lidar type -->
+  <!-- <depend>livox_ros_driver2</depend> -->
 
   <exec_depend>rosidl_default_runtime</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>

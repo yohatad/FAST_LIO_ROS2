@@ -57,6 +57,16 @@ def generate_launch_description():
         condition=IfCondition(rviz_use)
     )
 
+    # Publishes odom -> base_footprint from FAST-LIO's /Odometry message
+    # (odom -> l2lidar_imu, with FAST-LIO's own TF broadcast disabled),
+    # closing the tree per REP-105 (odom -> base_footprint -> ... -> l2lidar_imu).
+    lio_map_odom_bridge = Node(
+        package='fast_lio',
+        executable='lio_map_odom_bridge.py',
+        name='lio_map_odom_bridge',
+        output='screen'
+    )
+
     ld = LaunchDescription()
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_config_path_cmd)
@@ -65,6 +75,7 @@ def generate_launch_description():
     ld.add_action(declare_rviz_config_path_cmd)
 
     ld.add_action(fast_lio_node)
+    ld.add_action(lio_map_odom_bridge)
     ld.add_action(rviz_node)
 
     return ld
