@@ -1,0 +1,47 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: true
+        map_file_path: "/home/yoha/Lidar/run_corridor/legkilo_corridor.pcd"
+
+        common:
+            lid_topic:  "/points_raw"
+            imu_topic:  "/imu_raw"
+            time_sync_en: false          # ONLY turn on when external time sync is really impossible
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 2                # 1=Livox, 2=Velodyne, 3=Ouster  (legkilo = Velodyne VLP-16)
+            scan_line: 16
+            scan_rate: 10                # Hz (Velodyne)
+            timestamp_unit: 0            # per-point 'time' field is in SECONDS (0-s,1-ms,2-us,3-ns)
+            blind: 1.0
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  true       # online LiDAR-IMU extrinsic estimation (exact calib unknown)
+            extrinsic_T: [ 0.0, 0.0, 0.0 ]
+            extrinsic_R: [ 1., 0., 0.,
+                           0., 1., 0.,
+                           0., 0., 1. ]
+
+        publish:
+            path_en:  true
+            map_en: true
+            scan_publish_en:  true
+            dense_publish_en: true
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1

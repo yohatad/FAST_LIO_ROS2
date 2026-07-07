@@ -10,42 +10,37 @@
         map_file_path: "./test.pcd"
 
         common:
-            lid_topic:  "/points"
-            imu_topic:  "/imu/data_filtered"
+            lid_topic:  "/ouster/points"
+            imu_topic:  "/ouster/imu"
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
 
         preprocess:
-            lidar_type: 5                # 5 for Unitree L2 LiDAR
-            scan_line:  1
-            blind: 0.3
-            timestamp_unit: 1
-            scan_rate: 10
+            lidar_type: 3                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR,
+            scan_line: 128               # IndoorOffice1_dataset's /ouster/points is a 128-channel sensor (not the 64-channel default)
+            timestamp_unit: 3                 # 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
+            blind: 1.0                   # indoor -> shorter blind radius than the 4.0 outdoor default
 
         mapping:
-            acc_cov: 2.0
+            acc_cov: 0.1
             gyr_cov: 0.1
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
             fov_degree:    360.0
-            det_range:     30.0
+            det_range:     60.0          # indoor -> shorter than the 150.0 outdoor default
             extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
-            extrinsic_T: [ 0.007698, 0.014655, -0.00667 ]
-            extrinsic_R: [ 1., 0., 0.,
-                            0., 1., 0.,
-                            0., 0., 1.]
+            extrinsic_T: [ 0.0, 0.0, 0.0 ]
+            extrinsic_R: [1., 0., 0.,
+                        0., 1., 0.,
+                        0., 0., 1.]
 
         publish:
-            path_en: true                # true: publish Path
-            effect_map_en: false         # true: publish Effects
-            map_en: false                # true: publish Map cloud
+            path_en:  true
+            map_en: true                 # true: publish FAST-LIO's own raw (uncorrected) incremental map on /Laser_map
             scan_publish_en:  true       # false: close all the point cloud output
-            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+            dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
-            publish_tf: false            # false: do not broadcast map_frame -> body_frame TF (republisher owns odom -> base_footprint)
-            map_frame: "odom"            # frame_id used for the /Odometry message and Path/PointCloud headers
-            body_frame: "l2lidar_imu"    # child_frame_id used for the /Odometry message (must match the static base_footprint -> l2lidar_imu transform)
 
         pcd_save:
             pcd_save_en: true
