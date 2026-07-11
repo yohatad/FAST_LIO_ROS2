@@ -23,7 +23,14 @@
 
 /// *************Preconfiguration
 
-#define MAX_INI_COUNT (10)
+// Static-init window for the initial gravity/gyro-bias estimate (mean_acc,
+// mean_gyr in IMU_init below), in IMU samples. At the L2's ~252 Hz this used
+// to be 10 samples (~40 ms) -- shorter than even one period of the L2's own
+// dominant vibration line (13 Hz -> 77 ms, measured via Allan/PSD analysis of
+// imu_static_both_15min), so the startup gravity/bias estimate could land on
+// an arbitrary point in that vibration cycle instead of averaging it out.
+// ~500 samples (~2 s) comfortably spans >25 cycles of the slowest line.
+#define MAX_INI_COUNT (500)
 
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 

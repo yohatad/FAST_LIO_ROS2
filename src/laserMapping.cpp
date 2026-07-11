@@ -637,7 +637,22 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = body_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
+
+    // Linear velocity: state_point.vel is the IKFOM state's own filtered
+    // velocity estimate (get_f() integrates it straight into pos, i.e. it's
+    // expressed in the map/world frame). nav_msgs/Odometry's twist is
+    // conventionally in child_frame_id (body frame, REP 103), so rotate it
+    // by the inverse of the current orientation before publishing.
+    // This is populated so downstream consumers get the EKF's own smoothed
+    // velocity instead of differencing consecutive /Odometry poses
+    // themselves -- differencing amplifies the ~1-2cm scan-matching jitter
+    // into a badly noisy velocity (same effect that inflated raw-rate
+    // "distance traveled" 2x in the travel-distance analysis).
+    vect3 vel_body = state_point.rot.conjugate() * state_point.vel;
+    odomAftMapped.twist.twist.linear.x = vel_body[0];
+    odomAftMapped.twist.twist.linear.y = vel_body[1];
+    odomAftMapped.twist.twist.linear.z = vel_body[2];
+
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -649,6 +664,18 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    // vel occupies state indices 12-14 (see use-ikfom.hpp / get_f: res(i+12)
+    // is vel's derivative) -- this is the world-frame vel covariance, not
+    // rotated to match vel_body above, but still a useful relative measure
+    // of how well-determined the velocity estimate currently is.
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            odomAftMapped.twist.covariance[i*6 + j] = P(12 + i, 12 + j);
+
+    // publish only once every field above is populated -- previously this
+    // call happened before the covariance loop, so every message shipped
+    // the PREVIOUS cycle's covariance instead of its own.
+    pubOdomAftMapped->publish(odomAftMapped);
 
     if (publish_tf_en)
     {
