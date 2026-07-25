@@ -24,10 +24,20 @@
             scan_rate: 10
 
         mapping:
-            acc_cov: 2.0
-            gyr_cov: 0.1
-            b_acc_cov: 0.0001
-            b_gyr_cov: 0.0001
+            # IMU process noise — set from the measured L2 IMU characterization
+            # (Allan/PSD on bags/imu_static_both_15min, 2026-07-21). Deliberately
+            # asymmetric: the L2 accel is noisy (vibration), the gyro is good.
+            acc_cov: 2.0        # HIGH: accel carries the 17/74-87Hz motor-vibration
+                                # picket fence (measured var ~0.28 (m/s^2)^2) and also
+                                # absorbs the ~17ms IMU duty-cycle dt gaps (l2_sync_rate_ms).
+                                # Lower toward 0.3-0.5 ONLY after a dead-weight decoupled
+                                # mount removes the vibration.
+            gyr_cov: 0.1        # LOW: L2 gyro is measurably good (noise ~1.7e-4 rad/s/rtHz,
+                                # bias instab ~7.7e-6 — better than the RealSense gyro).
+                                # 0.1 balances that against the dt gaps; ~0.05 is defensible
+                                # once the sync gaps are reduced.
+            b_acc_cov: 0.0001   # accel bias less stable (instab ~2.1e-3 m/s^2)
+            b_gyr_cov: 0.0001   # gyro bias very stable; could lower with >1h drift data
             fov_degree:    360.0
             det_range:     30.0
             extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
