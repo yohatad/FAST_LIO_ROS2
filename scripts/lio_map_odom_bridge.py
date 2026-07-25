@@ -139,12 +139,16 @@ class LioMapOdomBridge(Node):
         self.declare_parameter('odom_topic', '/Odometry')
         # One-time static odom_level -> odom, for an upright RViz fixed frame.
         self.declare_parameter('level_frame', 'odom_level')
+        # Disable when something above owns odom (e.g. PGO's map -> odom), so
+        # odom does not end up with two parents (odom_level AND map).
+        self.declare_parameter('publish_level_frame', True)
 
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
         self.lidar_imu_frame = self.get_parameter('lidar_imu_frame').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.level_frame = self.get_parameter('level_frame').value
+        self.publish_level = self.get_parameter('publish_level_frame').value
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -159,11 +163,14 @@ class LioMapOdomBridge(Node):
         self.sub = self.create_subscription(
             Odometry, self.odom_topic, self.on_odom, 10)
 
+        level_msg = (f" and (once) {self.level_frame} -> {self.odom_frame}"
+                     if self.publish_level else
+                     f" (leveling {self.level_frame} DISABLED; a higher layer "
+                     f"owns {self.odom_frame})")
         self.get_logger().info(
             f"lio_map_odom_bridge: consuming {self.odom_topic} "
             f"({self.odom_frame} -> {self.lidar_imu_frame}), publishing "
-            f"{self.odom_frame} -> {self.base_frame} and (once) "
-            f"{self.level_frame} -> {self.odom_frame}. "
+            f"{self.odom_frame} -> {self.base_frame}{level_msg}. "
             f"Ensure FAST-LIO's own TF broadcast (publish.publish_tf) is DISABLED.")
 
     def _lookup_base_imu(self, stamp):
@@ -239,7 +246,7 @@ class LioMapOdomBridge(Node):
         # odom -> base_footprint = (odom -> l2lidar_imu) * (base_footprint -> l2lidar_imu)^-1
         m_odom_base = m_odom_imu @ np.linalg.inv(m_base_imu)
 
-        if not self._level_published:
+        if self.publish_level and not self._level_published:
             self._publish_level_frame(m_odom_base)
 
         translation, quaternion = matrix_to_translation_quaternion(m_odom_base)

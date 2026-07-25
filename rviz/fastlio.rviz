@@ -34,9 +34,11 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        body:
+        base_footprint:
           Value: true
-        camera_init:
+        odom:
+          Value: true
+        odom_level:
           Value: true
       Marker Scale: 1
       Name: TF
@@ -44,9 +46,10 @@ Visualization Manager:
       Show Axes: true
       Show Names: false
       Tree:
-        camera_init:
-          body:
-            {}
+        odom_level:
+          odom:
+            base_footprint:
+              {}
       Update Interval: 0
       Value: true
     - Angle Tolerance: 0.10000000149011612
@@ -221,7 +224,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 0; 0; 0
-    Fixed Frame: camera_init
+    Fixed Frame: odom_level
     Frame Rate: 30
   Name: root
   Tools:

@@ -17,6 +17,7 @@ def generate_launch_description():
         package_path, 'rviz', 'fastlio.rviz')
 
     use_sim_time = LaunchConfiguration('use_sim_time')
+    bridge_level_frame = LaunchConfiguration('bridge_level_frame')
     config_path = LaunchConfiguration('config_path')
     config_file = LaunchConfiguration('config_file')
     rviz_use = LaunchConfiguration('rviz')
@@ -25,6 +26,12 @@ def generate_launch_description():
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
         description='Use simulation (Gazebo) clock if true'
+    )
+    declare_bridge_level_frame_cmd = DeclareLaunchArgument(
+        'bridge_level_frame', default_value='true',
+        description='Have lio_map_odom_bridge publish the static odom_level -> odom '
+                    'leveling frame. Set false when a higher layer owns odom '
+                    '(e.g. PGO publishing map -> odom), so odom keeps one parent.'
     )
     declare_config_path_cmd = DeclareLaunchArgument(
         'config_path', default_value=default_config_path,
@@ -64,11 +71,16 @@ def generate_launch_description():
         package='fast_lio',
         executable='lio_map_odom_bridge.py',
         name='lio_map_odom_bridge',
-        output='screen'
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'publish_level_frame': bridge_level_frame,
+        }]
     )
 
     ld = LaunchDescription()
     ld.add_action(declare_use_sim_time_cmd)
+    ld.add_action(declare_bridge_level_frame_cmd)
     ld.add_action(declare_config_path_cmd)
     ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_rviz_cmd)

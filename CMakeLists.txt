@@ -136,6 +136,9 @@ install(
 
 install(PROGRAMS
   scripts/lio_map_odom_bridge.py
+  scripts/pgo_map_odom_bridge.py
+  scripts/cloud_range_filter.py
+  scripts/clean_occupancy_map.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
