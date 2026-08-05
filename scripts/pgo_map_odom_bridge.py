@@ -5,17 +5,17 @@ FAST-LIO owns   odom -> base_footprint  (via lio_map_odom_bridge).
 PGO owns        map  -> odom            (this node) -- the loop-closure
 correction, so the full tree is
 
-    map -> odom -> base_footprint -> l2lidar_frame -> l2lidar_imu
+    map -> odom -> base_footprint -> l2lidar_frame -> l2lidar_frame_imu
 
 Both FAST-LIO's /Odometry and PGO's /aft_pgo_odom describe the SAME physical
-body (the l2lidar_imu pose), just in two world frames:
+body (the l2lidar_frame_imu pose), just in two world frames:
 
-    /Odometry      : odom -> l2lidar_imu   (dense, from FAST-LIO)
-    /aft_pgo_odom  : map  -> l2lidar_imu   (sparse, latest optimized keyframe)
+    /Odometry      : odom -> l2lidar_frame_imu   (dense, from FAST-LIO)
+    /aft_pgo_odom  : map  -> l2lidar_frame_imu   (sparse, latest optimized keyframe)
 
 so the correction at a shared timestamp t_k is
 
-    map -> odom = (map -> l2lidar_imu)_pgo  *  (odom -> l2lidar_imu)_fastlio^-1
+    map -> odom = (map -> l2lidar_frame_imu)_pgo  *  (odom -> l2lidar_frame_imu)_fastlio^-1
 
 We keep a short buffer of FAST-LIO odometry, match each PGO keyframe pose to the
 FAST-LIO sample nearest its stamp, and republish the latest correction on every
@@ -27,8 +27,8 @@ LEVELING (optional, visualization only)
 ---------------------------------------
 map (like odom) is tied to the IMU's mounting tilt at t=0, so it is not
 gravity-aligned. When publish_level_frame is true we also publish a single
-static map_level -> map so map_level's axes match base_footprint's at t=0
-(Z-up, assuming the robot was level at startup). Use map_level as RViz's fixed
+static map -> map_lidar so map's axes match base_footprint's at t=0
+(Z-up, assuming the robot was level at startup). Use map as RViz's fixed
 frame for an upright, world-fixed view without disturbing the map->odom chain.
 """
 
@@ -117,15 +117,33 @@ class PgoMapOdomBridge(Node):
     def __init__(self):
         super().__init__('pgo_map_odom_bridge')
 
-        self.declare_parameter('map_frame', 'map')
-        self.declare_parameter('odom_frame', 'odom')
+        self.declare_parameter('map_frame', 'map_lidar')
+        self.declare_parameter('odom_frame', 'odom_lidar')
         self.declare_parameter('base_frame', 'base_footprint')
-        self.declare_parameter('level_frame', 'map_level')
-        # Dense FAST-LIO odometry (odom -> l2lidar_imu).
+        self.declare_parameter('level_frame', 'map')
+        # Dense FAST-LIO odometry (odom -> l2lidar_frame_imu).
         self.declare_parameter('odom_topic', '/Odometry')
-        # Latest optimized keyframe pose (map -> l2lidar_imu).
+        # Latest optimized keyframe pose (map -> l2lidar_frame_imu).
         self.declare_parameter('pgo_odom_topic', '/aft_pgo_odom')
         self.declare_parameter('publish_level_frame', True)
+        # Put the level frame's z=0 on the FLOOR (base_frame's height at t=0)
+        # rather than at the LIO start pose (~lidar mount height). base_frame
+        # is by definition the ground-plane projection of the robot, so this
+        # makes z=0 mean "the floor" for everything downstream -- notably
+        # octomap's /projected_map, which hardcodes its grid origin to z=0.
+        self.declare_parameter('level_frame_on_floor', True)
+        # Physical sensor frame the LIO's body corresponds to in the static
+        # tree; only used by level_source='calibration'.
+        self.declare_parameter('lidar_imu_frame', 'l2lidar_frame_imu')
+        # See lio_map_odom_bridge.py's level_source for the full rationale.
+        # 'calibration' reads the leveling straight off the rigid, calibrated
+        # base_frame -> lidar_imu_frame mount, so level_frame (and therefore
+        # the map_batch.pcd pgo_node saves INTO it) is byte-identical on every
+        # run and every backend. 'odometry' is the legacy runtime snapshot,
+        # which drifts with however far the robot moved before the first
+        # sample. Requires the LIO world frame to start at identity rotation
+        # (Point-LIO: mapping.gravity_align must be false).
+        self.declare_parameter('level_source', 'calibration')
         # How many recent FAST-LIO odom samples to keep for stamp matching.
         self.declare_parameter('odom_buffer_size', 1000)
 
@@ -136,6 +154,13 @@ class PgoMapOdomBridge(Node):
         self.odom_topic = self.get_parameter('odom_topic').value
         self.pgo_odom_topic = self.get_parameter('pgo_odom_topic').value
         self.publish_level = self.get_parameter('publish_level_frame').value
+        self.level_on_floor = self.get_parameter('level_frame_on_floor').value
+        self.lidar_imu_frame = self.get_parameter('lidar_imu_frame').value
+        self.level_source = self.get_parameter('level_source').value
+        if self.level_source not in ('calibration', 'odometry'):
+            self.get_logger().error(
+                f"level_source '{self.level_source}' invalid; using 'calibration'.")
+            self.level_source = 'calibration'
         self.buf_size = int(self.get_parameter('odom_buffer_size').value)
 
         self.tf_buffer = Buffer()
@@ -219,21 +244,48 @@ class PgoMapOdomBridge(Node):
 
     def _try_publish_level(self):
         """One-time static level_frame -> map so level_frame is Z-up at t=0."""
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.odom_frame, self.base_frame, rclpy.time.Time())
-        except (LookupException, ConnectivityException,
-                ExtrapolationException) as ex:
-            self.get_logger().warn(
-                f"Waiting for {self.odom_frame} -> {self.base_frame} to level "
-                f"{self.level_frame}: {ex}", throttle_duration_sec=5.0)
-            return
-
-        m_odom_base = transform_to_matrix(tf)
-        # map -> base = (map -> odom) * (odom -> base); early on map->odom ~ I.
-        m_map_base = self._m_map_odom @ m_odom_base
         m_corr = np.eye(4)
-        m_corr[:3, :3] = m_map_base[:3, :3].T  # inverse rotation -> upright
+        level_z = 0.0
+
+        if self.level_source == 'calibration':
+            # The LIO world frame starts at identity rotation, so map's axes ARE
+            # the lidar-IMU's axes: the leveling rotation is exactly the static
+            # mount rotation, and the mount height IS the floor offset. Pure
+            # calibration -- no dependence on odometry timing or robot motion.
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.base_frame, self.lidar_imu_frame, rclpy.time.Time())
+            except (LookupException, ConnectivityException,
+                    ExtrapolationException) as ex:
+                self.get_logger().warn(
+                    f"Waiting for static {self.base_frame} -> "
+                    f"{self.lidar_imu_frame} to level {self.level_frame}: {ex}",
+                    throttle_duration_sec=5.0)
+                return
+            m_base_imu = transform_to_matrix(tf)
+            m_corr[:3, :3] = m_base_imu[:3, :3]
+            if self.level_on_floor:
+                level_z = float(m_base_imu[2, 3])
+        else:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.odom_frame, self.base_frame, rclpy.time.Time())
+            except (LookupException, ConnectivityException,
+                    ExtrapolationException) as ex:
+                self.get_logger().warn(
+                    f"Waiting for {self.odom_frame} -> {self.base_frame} to level "
+                    f"{self.level_frame}: {ex}", throttle_duration_sec=5.0)
+                return
+
+            m_odom_base = transform_to_matrix(tf)
+            # map -> base = (map -> odom) * (odom -> base); early on map->odom ~ I.
+            m_map_base = self._m_map_odom @ m_odom_base
+            m_corr[:3, :3] = m_map_base[:3, :3].T  # inverse rotation -> upright
+
+            # Rotation alone leaves level_frame's origin at the LIO start pose,
+            # which sits at roughly lidar-mount height above the ground.
+            if self.level_on_floor:
+                level_z = -float((m_corr[:3, :3] @ m_map_base[:3, 3])[2])
 
         tr, q = matrix_to_translation_quaternion(m_corr)
         out = TransformStamped()
@@ -242,7 +294,7 @@ class PgoMapOdomBridge(Node):
         out.child_frame_id = self.map_frame
         out.transform.translation.x = 0.0
         out.transform.translation.y = 0.0
-        out.transform.translation.z = 0.0
+        out.transform.translation.z = level_z
         out.transform.rotation.x = float(q[0])
         out.transform.rotation.y = float(q[1])
         out.transform.rotation.z = float(q[2])
@@ -251,7 +303,10 @@ class PgoMapOdomBridge(Node):
         self._level_published = True
         self.get_logger().info(
             f"Published static {self.level_frame} -> {self.map_frame} "
-            f"(one-time leveling; use '{self.level_frame}' as RViz fixed frame).")
+            f"(one-time leveling from {self.level_source}, z=0 on the "
+            f"{'floor' if self.level_on_floor else 'LIO start pose'}, "
+            f"offset {level_z:+.3f} m; use '{self.level_frame}' as RViz "
+            f"fixed frame).")
 
 
 def main(args=None):

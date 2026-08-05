@@ -3,6 +3,42 @@ Log/*.png
 Log/*.txt
 Log/*.csv
 Log/*.pdf
-.vscode/c_cpp_properties.json
-.vscode/settings.json
 PCD/*.pcd
+
+# Editors / IDEs
+.vscode/
+.idea/
+.clangd/
+.cache/
+compile_commands.json
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# C++ / CMake build artifacts
+/install/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.o
+*.a
+*.so
+*.so.*
+
+# Recorded data / map output
+*.pcd
+*.ply
+*.bag
+*.db3
+rosbag2_*/
