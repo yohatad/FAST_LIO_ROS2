@@ -82,6 +82,15 @@ def generate_launch_description():
         package='rviz2',
         executable='rviz2',
         arguments=['-d', rviz_cfg],
+        # Without this RViz runs on the WALL clock while every message and
+        # transform carries bag time. Its TF cache then holds ~10 s around
+        # today, the clouds arrive stamped whenever the bag was recorded, and
+        # it silently drops all of them:
+        #   "Message Filter dropping message: ... the timestamp on the message
+        #    is earlier than all the data in the transform cache"
+        # Localization is unaffected -- only the view is. Every other node here
+        # already gets use_sim_time; this one was missed.
+        parameters=[{'use_sim_time': use_sim_time}],
         condition=IfCondition(rviz_use)
     )
 
