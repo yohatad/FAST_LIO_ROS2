@@ -33,6 +33,7 @@ frame for an upright, world-fixed view without disturbing the map->odom chain.
 """
 
 import bisect
+import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -233,7 +234,28 @@ class PgoMapOdomBridge(Node):
         return self._odom_m[best]
 
     def on_pgo_odom(self, msg: Odometry):
+        # Reject degenerate poses instead of latching a bogus correction.
+        # laserPosegraphOptimization's pubPath() used to publish a
+        # default-constructed Odometry before any keyframe was optimized:
+        # quaternion (0,0,0,0) and stamp 0. pose_to_matrix() silently falls back
+        # to identity rotation on that, so _m_map_odom would be built against
+        # whatever odom sample sat nearest t=0 and stay wrong until the next PGO
+        # update. The publisher is fixed, but validating here keeps this node
+        # safe against any upstream that is not.
+        q = msg.pose.pose.orientation
+        qn = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+        if not math.isfinite(qn) or abs(qn - 1.0) > 1e-3:
+            self.get_logger().warn(
+                f'Ignoring /aft_pgo_odom with non-unit quaternion (norm {qn:.4f}); '
+                'this is what an unoptimized or default-constructed pose looks like.',
+                throttle_duration_sec=5.0)
+            return
         t = stamp_to_sec(msg.header.stamp)
+        if t <= 0.0:
+            self.get_logger().warn(
+                'Ignoring /aft_pgo_odom with non-positive stamp.',
+                throttle_duration_sec=5.0)
+            return
         m_odom_body = self._nearest_odom(t)
         if m_odom_body is None:
             return  # no FAST-LIO odom buffered yet
