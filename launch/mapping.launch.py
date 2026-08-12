@@ -62,6 +62,15 @@ def generate_launch_description():
                      'wrong config (and the wrong TF frame contract via '
                      'lio_map_odom_bridge) for everyone else.'
     )
+    declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
+        'lidar_imu_frame', default_value='l2lidar_frame_imu',
+        description='Static-tree frame that FAST-LIO\'s publish.body_frame '
+                    'corresponds to, used by lio_map_odom_bridge to close '
+                    'odom -> base_footprint. MUST match the config: l2.yaml '
+                    'uses l2lidar_frame_imu, l2_rsimu.yaml uses '
+                    'camera_imu_optical_frame. A mismatch silently yields a '
+                    'wrong odom -> base_footprint.'
+    )
     declare_rviz_cmd = DeclareLaunchArgument(
         'rviz', default_value='true',
         description='Use RViz to monitor results'
@@ -76,6 +85,11 @@ def generate_launch_description():
         executable='fastlio_mapping',
         parameters=[PathJoinSubstitution([config_path, config_file]),
                     {'use_sim_time': use_sim_time}],
+        # Standard odometry topic across every LIO variant: FAST-LIO publishes
+        # /Odometry natively, Point-LIO and FAST-LIVO2 /aft_mapped_to_init.
+        # Each mapping launch remaps its own to /odom_lio so consumers need not
+        # know which estimator is running.
+        remappings=[('/Odometry', '/odom_lio')],
         output='screen'
     )
     rviz_node = Node(
@@ -107,6 +121,8 @@ def generate_launch_description():
             'publish_level_frame': bridge_level_frame,
             'level_frame_as_child': LaunchConfiguration('level_frame_as_child'),
             'flatten_base_frame': flatten_base_frame,
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
+            'odom_topic': '/odom_lio',
         }]
     )
 
@@ -117,6 +133,7 @@ def generate_launch_description():
     ld.add_action(declare_flatten_base_frame_cmd)
     ld.add_action(declare_config_path_cmd)
     ld.add_action(declare_config_file_cmd)
+    ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
 

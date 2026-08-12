@@ -1,54 +1,81 @@
+# FAST-LIO configuration for the Unitree L2 lidar on the Pepper rig.
+# Companion: point_lio/config/l2lidar_node.yaml (same sensor, other backend).
+
 /**:
     ros__parameters:
-        feature_extract_enable: false
-        point_filter_num: 3
-        max_iteration: 3
-        filter_size_surf: 0.25
-        filter_size_map: 0.25
-        cube_side_length: 1000.0
-        runtime_pos_log_enable: false
-        map_file_path: "/home/yoha/Lidar/run_l2_fastlio/l2_fastlio_map.pcd"
+        feature_extract_enable: false   # LOAM edge/plane front end vs FAST-LIO2 raw-point registration. INERT on lidar_type 5: l2_handler (preprocess.cpp:571) never branches on feature_enabled, it always fills pl_surf. Documents intent; setting true changes nothing.
+        point_filter_num: 3             # keep every Nth point of a scan; main real-time lever
+        max_iteration: 3                # max iterated-EKF update iterations per scan
+        filter_size_surf: 0.25          # voxel leaf size (m) for the incoming scan
+        filter_size_map: 0.25           # voxel leaf size (m) for the ikd-Tree map; bounds achievable accuracy
+        cube_side_length: 1000.0        # side (m) of the local map cube kept in the ikd-Tree
+        runtime_pos_log_enable: false   # write per-scan timing/state logs to FAST_LIO/Log/ (exposes res_mean_last)
+        map_file_path: "/home/yoha/Lidar/run_l2_fastlio/l2_fastlio_map.pcd"   # where pcd_save / the /map_save service writes; raw, NOT loop closed
 
         common:
-            lid_topic:  "/points"
-            imu_topic:  "/imu/data"
+            lid_topic:  "/points"       # input PointCloud2 topic
+            imu_topic:  "/imu/data"     # input Imu topic; subscribed RELIABLE, so bag replay needs config/play_qos.yaml
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
 
         preprocess:
             lidar_type: 5                # 5 for Unitree L2 LiDAR
-            scan_line:  1
-            blind: 0.3
-            timestamp_unit: 1
-            scan_rate: 10
+            scan_line:  1                # -> N_SCANS. INERT on lidar_type 5: l2_handler has no ring logic and the L2 cloud carries no ring field. N_SCANS is only used by the ring-based handlers (lines 117-323). point_lio's 18 is equally inert -- the mismatch has no effect either way.
+            # Value unchanged, but its MEANING changed on 2026-08-10. The driver
+            # used to publish `range` as raw counts/1000 with the calibration
+            # bias omitted, so the field read ~0.5 m high and this 0.1 was
+            # inert -- no return could ever fall below it. l2lidar_node now
+            # publishes calibrated metres, so 0.1 finally filters what it says:
+            # 0.03% of points (~1/scan) on bag/slam_august_8_bag. Effective
+            # behaviour is therefore unchanged; the setting is just honest now.
+            # NOTE bags recorded BEFORE that fix carry the old inflated field:
+            # replaying them with this config filters nothing, as before.
+            blind: 0.1                   # min range (m); closer returns dropped as self-hits
+            # INERT on lidar_type 5. l2_handler (preprocess.cpp:600) hardcodes
+            # `added_pt.curvature = src.time * 1.0e3f` and never reads
+            # time_unit_scale -- which is only used by the oust64/velodyne/
+            # mid360/avia handlers (lines 245/297/368/440). That hardcoded 1e3
+            # IS the correct seconds->ms conversion, so deskewing on this path
+            # has always been right. 0 (=SEC) is kept because it documents the
+            # true unit of the field; it does not drive anything.
+            # CORRECTION 2026-08-10: an earlier comment here claimed the old
+            # value of 1 (=MS) had disabled deskewing. That was wrong -- the
+            # parameter never reached this code path at all.
+            # Point-LIO is the OPPOSITE: its unilidar_handler:288 DOES apply
+            # time_unit_scale, so timestamp_unit is live there and must stay 0.
+            timestamp_unit: 0
+            scan_rate: 10                # -> SCAN_RATE. INERT on lidar_type 5: only read at preprocess.cpp:320 and 501, both outside l2_handler. The 10-vs-measured-11.3 Hz mismatch therefore has no effect.
 
         mapping:
             # IMU process noise — set from the measured L2 IMU characterization
             # (Allan/PSD on bags/imu_static_both_15min, 2026-07-21). Deliberately
             # asymmetric: the L2 accel is noisy (vibration), the gyro is good.
-            acc_cov: 2.0        # HIGH: accel carries the 17/74-87Hz motor-vibration
+            # 2026-08-10: the dt gaps cited below are NOT present in
+            # bag/slam_august_8_bag (251.7 Hz, median dt 3.97 ms, zero gaps
+            # >3x median), so gyr_cov's "~0.05 once gaps are reduced" now applies.
+            acc_cov: 2.0        # accel measurement noise. HIGH: carries the 17/74-87Hz motor-vibration
                                 # picket fence (measured var ~0.28 (m/s^2)^2) and also
                                 # absorbs the ~17ms IMU duty-cycle dt gaps (l2_sync_rate_ms).
                                 # Lower toward 0.3-0.5 ONLY after a dead-weight decoupled
                                 # mount removes the vibration.
-            gyr_cov: 0.1        # LOW: L2 gyro is measurably good (noise ~1.7e-4 rad/s/rtHz,
+            gyr_cov: 0.1        # gyro measurement noise. LOW: L2 gyro is measurably good (noise ~1.7e-4 rad/s/rtHz,
                                 # bias instab ~7.7e-6 — better than the RealSense gyro).
                                 # 0.1 balances that against the dt gaps; ~0.05 is defensible
                                 # once the sync gaps are reduced.
-            b_acc_cov: 0.0001   # accel bias less stable (instab ~2.1e-3 m/s^2)
-            b_gyr_cov: 0.0001   # gyro bias very stable; could lower with >1h drift data
-            fov_degree:    360.0
-            det_range:     30.0
-            extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
-            extrinsic_T: [ 0.007698, 0.014655, -0.00667 ]
-            extrinsic_R: [ 1., 0., 0.,
+            b_acc_cov: 0.0001   # accel BIAS random walk; accel bias less stable (instab ~2.1e-3 m/s^2)
+            b_gyr_cov: 0.0001   # gyro BIAS random walk; gyro bias very stable; could lower with >1h drift data
+            fov_degree:    360.0         # DEAD in both backends: laserMapping.cpp:925-926 computes FOV_DEG/HALF_FOV_COS from it and nothing ever reads them. point_lio's 180.0 is therefore harmless too.
+            det_range:     30.0          # max usable range (m); drives local-map cube management
+            extrinsic_est_en:  false     # true: enable the online estimation of IMU-LiDAR extrinsic
+            extrinsic_T: [ 0.007698, 0.014655, -0.00667 ]   # -> Lidar_T_wrt_IMU (laserMapping.cpp:937): the LIDAR's origin expressed in the IMU frame, i.e. the INVERSE of the static l2lidar_frame -> l2lidar_frame_imu TF (-0.007698,-0.014655,+0.00667). Sign verified 2026-08-10; identical to point_lio's copy.
+            extrinsic_R: [ 1., 0., 0.,                      # lidar->IMU rotation matrix (identity: axes already aligned)
                             0., 1., 0.,
                             0., 0., 1.]
 
         publish:
             path_en: true                # true: publish Path
-            effect_map_en: false         # true: publish Effects
+            effect_map_en: true          # publish /cloud_effected, whose width IS effct_feat_num (laserMapping.cpp:574) -- the live constraint count. Enabled 2026-08-10 for utils/lio_health.py; publish-only, no effect on the estimate. Set false to save the extra cloud's CPU/bandwidth.
             map_en: true                 # true: accumulate map cloud (required for the /map_save service to write map_file_path)
             scan_publish_en:  true       # false: close all the point cloud output
             dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
@@ -58,6 +85,6 @@
             body_frame: "l2lidar_frame_imu"    # child_frame_id used for the /Odometry message (must match the static base_footprint -> l2lidar_frame_imu transform)
 
         pcd_save:
-            pcd_save_en: true
+            pcd_save_en: true            # write the accumulated cloud at shutdown; held in RAM for the whole run
             interval: -1                 # how many LiDAR frames saved in each pcd file;
                                         # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

@@ -122,7 +122,7 @@ class PgoMapOdomBridge(Node):
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('level_frame', 'map')
         # Dense FAST-LIO odometry (odom -> l2lidar_frame_imu).
-        self.declare_parameter('odom_topic', '/Odometry')
+        self.declare_parameter('odom_topic', '/odom_lio')
         # Latest optimized keyframe pose (map -> l2lidar_frame_imu).
         self.declare_parameter('pgo_odom_topic', '/aft_pgo_odom')
         self.declare_parameter('publish_level_frame', True)

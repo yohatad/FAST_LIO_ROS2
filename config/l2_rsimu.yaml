@@ -1,0 +1,127 @@
+# FAST-LIO for the Unitree L2 lidar driven by the REALSENSE IMU (/camera/imu)
+# instead of the L2's own (/imu/data).  A/B partner to l2.yaml -- everything not
+# mentioned below is identical to it, so read that file for the shared rationale.
+#
+# WHY. Measured on bag/slam_august_8_bag with utils/imu_crosscheck.py: the L2
+# gyro reports ~0 rad/s while the platform is genuinely rotating, for 29.7% of
+# all rotating time across 49 episodes. Splitting all 52 turns by whether it
+# dropped out, FAST-LIO's yaw error against the (independent, verified-healthy)
+# RealSense IMU is:
+#     L2 gyro dropped out   n=14   11.9% mean, 48.3% worst
+#     L2 gyro healthy       n=38    1.6% mean,  6.5% worst
+# The RealSense is rigidly attached to the L2 and is clean on the same bag:
+# 200 Hz, dt max 11 ms, zero gaps > 3x median, no saturation.
+#
+# STATUS: UNVALIDATED. This config has not yet been run. Compare against
+# l2.yaml on the same bag before adopting it.
+
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.25
+        filter_size_map: 0.25
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "/home/yoha/Lidar/run_l2_fastlio_rsimu/l2_fastlio_rsimu_map.pcd"
+
+        common:
+            lid_topic:  "/points"
+            imu_topic:  "/camera/imu"   # CHANGED from /imu/data
+            # /camera/imu was recorded BEST_EFFORT (metadata reliability: 2),
+            # exactly like /imu/data, so bag replay needs it in
+            # config/play_qos.yaml or rmw silently delivers nothing and
+            # FAST-LIO waits forever for IMU init.
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+            # ^ SWEEP THIS FIRST. The L2 and the RealSense are timestamped by
+            # different drivers, so unlike l2.yaml's 0.0 this is not known to be
+            # right. Cross-correlating the two gyros put the offset at -5 ms
+            # (i.e. ~0), but that is a rate correlation, not a lidar-to-IMU
+            # calibration. Try +/-20 ms in 5 ms steps and keep the best.
+
+        preprocess:
+            lidar_type: 5
+            scan_line:  1
+            blind: 0.1                   # see l2.yaml -- gates on the `range`
+                                         # field, which is calibrated metres
+                                         # since the l2lidar_node fix
+            timestamp_unit: 0
+            scan_rate: 10
+
+        mapping:
+            # Re-derived for the RealSense IMU from a stationary window
+            # (736.4-739.4 s) of bag/slam_august_8_bag. Measured 1-sigma there:
+            #   gyro   L2 0.0144 rad/s   RealSense 0.0575 rad/s  -> var x16.0
+            #   accel  L2 0.3812 m/s^2   RealSense 0.1389 m/s^2  -> var x0.13
+            # Scaling l2.yaml's values by those variance ratios gives the two
+            # below. The swap is the expected one: the L2's IMU sits inside the
+            # spinning-motor housing and eats the vibration, while its gyro is
+            # the quieter part -- so moving to the RealSense trades a noisier
+            # gyro for a much quieter accelerometer.
+            acc_cov: 0.3        # was 2.0 on the L2. Note this lands in the
+                                # 0.3-0.5 band l2.yaml says is only reachable
+                                # "after a dead-weight decoupled mount removes
+                                # the vibration" -- the RealSense IMU is already
+                                # decoupled from the L2 motor, so it gets there
+                                # without the mount change.
+            gyr_cov: 1.6        # was 0.1 on the L2. The RealSense gyro is
+                                # genuinely 4x noisier (16x in variance), which
+                                # matches LOG.md section 5.4. A noisier gyro that
+                                # always reports still beats a quiet one that
+                                # stops reporting during 30% of rotation.
+            b_acc_cov: 0.0001   # bias random walk: L2 values kept as a starting
+            b_gyr_cov: 0.0001   # point; NOT characterised for the D435i yet.
+            fov_degree:    360.0
+            det_range:     30.0
+            extrinsic_est_en:  false
+            # Lidar origin expressed in the RealSense IMU frame, i.e.
+            # p_camera_imu = extrinsic_R * p_l2lidar + extrinsic_T.
+            # Composed from pepper_slam/config/sensor_tf.yaml
+            #   l2lidar_frame -> camera_camera_link
+            #     xyz [0.038541, -0.036473, 0.021032]
+            #     quat [0.674794, -0.166617, 0.703353, 0.148951]   (rotation
+            #     MEASURED 2026-08-06 by utils/plane_calib.py)
+            # with the driver's camera_camera_link -> camera_gyro_frame ->
+            # camera_imu_frame (identity rotation, xyz [-0.011740, -0.005520,
+            # 0.005100]), then inverted. |T| = 57.8 mm, det(R) = 1.000000.
+            # The same composition reproduces l2.yaml's L2 extrinsic exactly,
+            # which is how it was verified.
+            # NB the target is camera_imu_OPTICAL_frame: /camera/imu is stamped
+            # 'camera_imu_optical_frame', NOT 'camera_imu_frame'. Omitting that
+            # last optical rotation (-0.5, 0.5, -0.5, 0.5) leaves the extrinsic
+            # 87.4 deg wrong and FAST-LIO logs "No Effective Points!".
+            # VALIDATED against gravity: this R maps the L2's measured gravity
+            # (0.921, -0.389, 0.024) onto the RealSense's (0.006, -1.000, -0.005)
+            # to within 2.59 deg -- the residual is calibration error, matching
+            # the 3.44 deg floor-vs-accel figure already in LOG.md.
+            extrinsic_T: [ 0.009866, 0.056363, -0.008096 ]
+            extrinsic_R: [  0.434395,  0.900105,  0.033359,
+                           -0.899601,  0.435404, -0.033784,
+                           -0.044933, -0.015334,  0.998872 ]
+
+        publish:
+            path_en: true
+            effect_map_en: true
+            map_en: true
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+            publish_tf: false
+            map_frame: "odom_lidar"
+            # CHANGED from l2lidar_frame_imu: /Odometry's child_frame_id is the
+            # IMU body frame, which is now the camera's. sensor_tf.yaml already
+            # publishes base_footprint -> l2lidar_frame -> camera_camera_link ->
+            # camera_gyro_frame -> camera_imu_frame -> camera_imu_optical_frame,
+            # so lio_map_odom_bridge can still close odom -> base_footprint --
+            # but it must be told which frame: pass
+            #   lidar_imu_frame:=camera_imu_optical_frame
+            # to mapping.launch.py, or it keeps its l2lidar_frame_imu default
+            # and produces a wrong odom -> base_footprint.
+            body_frame: "camera_imu_optical_frame"
+
+        pcd_save:
+            pcd_save_en: false           # off by default for A/B trials, so a
+                                         # comparison run cannot overwrite a map
+            interval: -1

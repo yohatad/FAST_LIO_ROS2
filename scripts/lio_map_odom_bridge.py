@@ -149,7 +149,7 @@ class LioMapOdomBridge(Node):
         # corresponds to in the static tree (base_footprint -> ... -> l2lidar_frame_imu).
         self.declare_parameter('lidar_imu_frame', 'l2lidar_frame_imu')
         # FAST-LIO odometry topic (frame_id=odom_frame, child_frame_id=lidar_imu_frame).
-        self.declare_parameter('odom_topic', '/Odometry')
+        self.declare_parameter('odom_topic', '/odom_lio')
         # One-time static odom -> odom_lidar, for an upright RViz fixed frame.
         self.declare_parameter('level_frame', 'odom')
         # Disable when something above owns odom (e.g. PGO's map -> odom), so
