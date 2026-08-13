@@ -161,7 +161,6 @@ def generate_launch_description():
     )
 
     ld = LaunchDescription()
-    ld.add_action(OpaqueFunction(function=_resolve_lidar_imu_frame))
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_bridge_level_frame_cmd)
     ld.add_action(declare_level_frame_as_child_cmd)
@@ -172,6 +171,10 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
 
+    # AFTER every DeclareLaunchArgument: the resolver reads config_file and
+    # lidar_imu_frame, which do not exist in the context until their
+    # declares have run.
+    ld.add_action(OpaqueFunction(function=_resolve_lidar_imu_frame))
     ld.add_action(fast_lio_node)
     ld.add_action(lio_map_odom_bridge)
     ld.add_action(rviz_node)
