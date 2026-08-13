@@ -3,11 +3,40 @@ import os.path
 from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.conditions import IfCondition
 
 from launch_ros.actions import Node
+
+
+# Which static frame FAST-LIO's publish.body_frame corresponds to is a PROPERTY
+# OF THE CONFIG, not an independent choice: l2.yaml estimates the L2's IMU,
+# l2_rsimu.yaml estimates the RealSense's. lio_map_odom_bridge uses it to close
+# odom -> base_footprint, and a mismatch is silent -- the tree still resolves,
+# it is just wrong. So derive it, and let an explicit lidar_imu_frame override
+# for configs this table does not know.
+_BODY_FRAME_BY_CONFIG = {
+    'l2.yaml': 'l2lidar_frame_imu',
+    'l2_rsimu.yaml': 'camera_imu_optical_frame',
+}
+
+
+def _resolve_lidar_imu_frame(context, *args, **kwargs):
+    from launch.actions import SetLaunchConfiguration
+    explicit = LaunchConfiguration('lidar_imu_frame').perform(context)
+    if explicit:
+        return [SetLaunchConfiguration('resolved_lidar_imu_frame', explicit)]
+    cfg = os.path.basename(LaunchConfiguration('config_file').perform(context))
+    frame = _BODY_FRAME_BY_CONFIG.get(cfg)
+    if frame is None:
+        raise RuntimeError(
+            f"config_file '{cfg}' is not in mapping.launch.py's body-frame "
+            f"table {sorted(_BODY_FRAME_BY_CONFIG)}, so lidar_imu_frame cannot "
+            f"be derived. Pass lidar_imu_frame:=<frame> explicitly -- it must "
+            f"match the config's publish.body_frame, or lio_map_odom_bridge "
+            f"closes odom -> base_footprint through the wrong frame.")
+    return [SetLaunchConfiguration('resolved_lidar_imu_frame', frame)]
 
 
 def generate_launch_description():
@@ -62,8 +91,13 @@ def generate_launch_description():
                      'wrong config (and the wrong TF frame contract via '
                      'lio_map_odom_bridge) for everyone else.'
     )
+    # DERIVED from config_file when left empty -- see _resolve_lidar_imu_frame.
+    # It used to default to 'l2lidar_frame_imu' unconditionally, which made the
+    # RealSense-IMU config a two-argument change that five callers got wrong by
+    # omission: they passed config_file and inherited the L2 frame, silently
+    # producing a wrong odom -> base_footprint with no error anywhere.
     declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
-        'lidar_imu_frame', default_value='l2lidar_frame_imu',
+        'lidar_imu_frame', default_value='',
         description='Static-tree frame that FAST-LIO\'s publish.body_frame '
                     'corresponds to, used by lio_map_odom_bridge to close '
                     'odom -> base_footprint. MUST match the config: l2.yaml '
@@ -121,12 +155,13 @@ def generate_launch_description():
             'publish_level_frame': bridge_level_frame,
             'level_frame_as_child': LaunchConfiguration('level_frame_as_child'),
             'flatten_base_frame': flatten_base_frame,
-            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
+            'lidar_imu_frame': LaunchConfiguration('resolved_lidar_imu_frame'),
             'odom_topic': '/odom_lio',
         }]
     )
 
     ld = LaunchDescription()
+    ld.add_action(OpaqueFunction(function=_resolve_lidar_imu_frame))
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_bridge_level_frame_cmd)
     ld.add_action(declare_level_frame_as_child_cmd)
