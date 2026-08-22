@@ -970,7 +970,27 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        // SensorDataQoS (BEST_EFFORT), not a plain depth. A plain depth yields
+        // the DEFAULT profile, i.e. RELIABLE, and a RELIABLE subscriber matches
+        // NOTHING against a BEST_EFFORT publisher -- which is what every real
+        // IMU driver offers, l2lidar_node included. rmw then silently delivers
+        // no IMU at all: FAST-LIO waits forever for IMU init, never emits
+        // /Odometry, and prints no error. The lidar subscription above already
+        // used SensorDataQoS, which is why /points worked while /imu/data did
+        // not, and why this only ever showed up as a broken TF tree
+        // (odom -> base_footprint missing, because lio_map_odom_bridge had no
+        // odometry to close it with).
+        //
+        // This was masked on bag replay by config/play_qos.yaml, which
+        // re-offers /imu/data as RELIABLE. There is no such override when the
+        // driver is live, so the bug only appeared on the real robot.
+        // BEST_EFFORT readers match BOTH kinds of writer, so this is strictly
+        // more compatible than what it replaces.
+        //
+        // keep_last(200): SensorDataQoS defaults to depth 5, far too shallow
+        // for a 250 Hz IMU feeding a mapping loop that stalls for tens of ms.
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            imu_topic, rclcpp::SensorDataQoS().keep_last(200), imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
