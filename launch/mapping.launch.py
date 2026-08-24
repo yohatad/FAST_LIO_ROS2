@@ -16,27 +16,51 @@ from launch_ros.actions import Node
 # odom -> base_footprint, and a mismatch is silent -- the tree still resolves,
 # it is just wrong. So derive it, and let an explicit lidar_imu_frame override
 # for configs this table does not know.
-_BODY_FRAME_BY_CONFIG = {
-    'l2.yaml': 'l2lidar_frame_imu',
-    'l2_rsimu.yaml': 'camera_imu_optical_frame',
-}
-
 
 def _resolve_lidar_imu_frame(context, *args, **kwargs):
+    """Which frame FAST-LIO's pose estimate refers to.
+
+    lio_map_odom_bridge needs this to look up base_footprint -> <frame> and
+    close odom -> base_footprint. It MUST equal the estimator's own
+    publish.body_frame, or the bridge composes through the wrong rigid offset
+    and produces a plausible-looking pose that is simply wrong.
+
+    So read it from the config rather than keeping a second copy. This used to
+    be a hardcoded {config_file: frame} table in this file -- a hand-maintained
+    mirror of the yaml that had to be edited every time a config was added, and
+    that could silently disagree with the file it mirrored. The yaml is the one
+    source of truth; the node reads publish.body_frame from it too.
+    """
     from launch.actions import SetLaunchConfiguration
     explicit = LaunchConfiguration('lidar_imu_frame').perform(context)
     if explicit:
         return [SetLaunchConfiguration('resolved_lidar_imu_frame', explicit)]
-    cfg = os.path.basename(LaunchConfiguration('config_file').perform(context))
-    frame = _BODY_FRAME_BY_CONFIG.get(cfg)
-    if frame is None:
+
+    import yaml
+    path = os.path.join(LaunchConfiguration('config_path').perform(context),
+                        os.path.basename(
+                            LaunchConfiguration('config_file').perform(context)))
+    try:
+        with open(path) as fh:
+            doc = yaml.safe_load(fh) or {}
+    except OSError as exc:
         raise RuntimeError(
-            f"config_file '{cfg}' is not in mapping.launch.py's body-frame "
-            f"table {sorted(_BODY_FRAME_BY_CONFIG)}, so lidar_imu_frame cannot "
-            f"be derived. Pass lidar_imu_frame:=<frame> explicitly -- it must "
-            f"match the config's publish.body_frame, or lio_map_odom_bridge "
-            f"closes odom -> base_footprint through the wrong frame.")
-    return [SetLaunchConfiguration('resolved_lidar_imu_frame', frame)]
+            f"cannot read FAST-LIO config '{path}' to determine the body frame "
+            f"({exc}). Pass lidar_imu_frame:=<frame> explicitly.")
+
+    frame = None
+    for top in doc.values():
+        if isinstance(top, dict):
+            params = top.get('ros__parameters', top)
+            if isinstance(params, dict):
+                pub = params.get('publish')
+                if isinstance(pub, dict) and pub.get('body_frame'):
+                    frame = pub['body_frame']
+                    break
+
+    # Matches LaserMappingNode's own declare_parameter default, so a config that
+    # omits publish.body_frame still lines up with what the node will stamp.
+    return [SetLaunchConfiguration('resolved_lidar_imu_frame', frame or 'body')]
 
 
 def generate_launch_description():
@@ -59,14 +83,14 @@ def generate_launch_description():
     )
     declare_bridge_level_frame_cmd = DeclareLaunchArgument(
         'bridge_level_frame', default_value='true',
-        description='Have lio_map_odom_bridge publish the static odom -> odom_lidar '
+        description='Have lio_map_odom_bridge publish the static odom -> lio_init '
                     'leveling frame. Set false when a higher layer owns odom '
                     '(e.g. PGO publishing map -> odom), so odom keeps one parent.'
     )
     declare_level_frame_as_child_cmd = DeclareLaunchArgument(
         'level_frame_as_child', default_value='false',
-        description='Publish the leveling transform as odom_lidar -> odom '
-                    '(child) instead of odom -> odom_lidar (parent). Use with '
+        description='Publish the leveling transform as lio_init -> odom '
+                    '(child) instead of odom -> lio_init (parent). Use with '
                     'bridge_level_frame:=true when a localizer already owns '
                     'map -> odom, so odom still exists without giving '
                     'odom two parents.'

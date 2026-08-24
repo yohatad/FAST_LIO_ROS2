@@ -109,7 +109,7 @@
             dense_publish_en: false
             scan_bodyframe_pub_en: true
             publish_tf: false
-            map_frame: "odom_lidar"
+            map_frame: "lio_init"
             # CHANGED from l2lidar_frame_imu: /Odometry's child_frame_id is the
             # IMU body frame, which is now the camera's. sensor_tf.yaml already
             # publishes base_footprint -> l2lidar_frame -> camera_camera_link ->

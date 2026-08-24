@@ -70,7 +70,7 @@ Visualization Manager:
           Value: true
         odom:
           Value: true
-        odom_lidar:
+        lio_init:
           Value: true
       Marker Scale: 1
       Name: TF
@@ -79,7 +79,7 @@ Visualization Manager:
       Show Names: false
       Tree:
         odom:
-          odom_lidar:
+          lio_init:
             base_footprint:
               l2lidar_frame:
                 camera_camera_link:
