@@ -978,7 +978,7 @@ public:
         // /Odometry, and prints no error. The lidar subscription above already
         // used SensorDataQoS, which is why /points worked while /imu/data did
         // not, and why this only ever showed up as a broken TF tree
-        // (odom -> base_footprint missing, because lio_map_odom_bridge had no
+        // (odom -> base_footprint missing, because lio_odom_bridge had no
         // odometry to close it with).
         //
         // This was masked on bag replay by config/play_qos.yaml, which

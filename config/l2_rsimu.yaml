@@ -114,7 +114,7 @@
             # IMU body frame, which is now the camera's. sensor_tf.yaml already
             # publishes base_footprint -> l2lidar_frame -> camera_camera_link ->
             # camera_gyro_frame -> camera_imu_frame -> camera_imu_optical_frame,
-            # so lio_map_odom_bridge can still close odom -> base_footprint --
+            # so lio_odom_bridge can still close odom -> base_footprint --
             # but it must be told which frame: pass
             #   lidar_imu_frame:=camera_imu_optical_frame
             # to mapping.launch.py, or it keeps its l2lidar_frame_imu default

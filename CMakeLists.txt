@@ -134,7 +134,7 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
-# NOTE: the Pepper bridge/filter scripts (lio_map_odom_bridge.py,
+# NOTE: the Pepper bridge/filter scripts (lio_odom_bridge.py,
 # pgo_map_odom_bridge.py, cloud_range_filter.py) moved to
 # pepper_slam/scripts. They were never upstream FAST-LIO code, and
 # keeping them here made point_lio, fastlio_lc_pgo, FAST-LIVO2 and
