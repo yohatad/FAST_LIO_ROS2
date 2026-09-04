@@ -43,3 +43,7 @@ cmake_install.cmake
 *.db3
 rosbag2_*/
 *.log
+# build litter: colcon/FAST-LIO scratch, not source
+/log/
+/src/log/
+/src/install/
