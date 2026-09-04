@@ -43,7 +43,13 @@ cmake_install.cmake
 *.db3
 rosbag2_*/
 *.log
-# build litter: colcon/FAST-LIO scratch, not source
+# colcon scratch, if a build is ever run from INSIDE this package instead of the
+# workspace root. It does not belong here -- delete it rather than rely on this;
+# a build/ inside src/ shadows nothing but wastes 20 MB and confuses `find`.
+# Anchored to this package's root and its src/, which is where colcon drops them.
+/build/
+/install/
 /log/
-/src/log/
+/src/build/
 /src/install/
+/src/log/
