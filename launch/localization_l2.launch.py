@@ -73,6 +73,15 @@ def generate_launch_description():
         # wrong place agree perfectly. MEASURED starting mid-corridor, it locked
         # 41 m from truth on two mutually-consistent matches. These ask the map
         # instead -- what fraction of the scan lands on it at the proposed pose.
+        # Agreement between two estimates taken from a STANDSTILL is close to
+        # vacuous -- the scans are near-identical, so of course they agree.
+        # Requiring travel between them makes a spurious match prove itself
+        # across motion. Set false to accept a lock without moving (upstream
+        # behaviour), at the cost of the failure this was added to stop.
+        DeclareLaunchArgument('init_require_motion', default_value='true'),
+        DeclareLaunchArgument('init_motion_min', default_value='0.50',
+            description='Metres of odometry required between the agreeing '
+                        'estimates. Only used when init_require_motion.'),
         DeclareLaunchArgument('init_min_overlap', default_value='0.70'),
         DeclareLaunchArgument('init_overlap_dist', default_value='0.20',
             description='Metres. Keep this TIGHT: at 1.0 m a pose 41 m out still '
@@ -101,6 +110,9 @@ def generate_launch_description():
              'localization.sc_dist_thres': LaunchConfiguration('sc_dist_thres'),
              'localization.init_agree_count': LaunchConfiguration('init_agree_count'),
              'localization.init_agree_dist': LaunchConfiguration('init_agree_dist'),
+             'localization.init_require_motion': ParameterValue(
+                 LaunchConfiguration('init_require_motion'), value_type=bool),
+             'localization.init_motion_min': LaunchConfiguration('init_motion_min'),
              'localization.init_min_overlap': LaunchConfiguration('init_min_overlap'),
              'localization.init_overlap_dist': LaunchConfiguration('init_overlap_dist')},
         ])

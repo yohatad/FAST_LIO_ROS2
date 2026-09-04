@@ -180,6 +180,21 @@ double sc_lidar_height = 0.5, sc_max_radius = 10.0, sc_dist_thres = 0.15;
 // metre of something. That is the same saturation that made the old stack's
 // ICP fitness useless. At 0.20 m the wrong candidates score 50-67% and the
 // right ones 99-100% -- a clean separation.
+// Require the agreeing estimates to come from scans the robot actually MOVED
+// between, and compare them with the odometry between compensated out.
+//
+// Without this, agreement is close to vacuous when starting from a standstill:
+// two "independent" estimates are then taken from near-identical scans, so of
+// course they agree. MEASURED at a stationary start mid-corridor: keyframes
+// 2625 and 2636 -- eleven apart, the same place -- both scored 93-100% overlap
+// and agreed to 0.35 m, and the lock was 40 m from truth.
+//
+// With it, a spurious match has to stay consistent ACROSS the robot moving,
+// which is a much harder thing to be accidentally right about. The cost is that
+// initialization cannot finish while stationary -- arguably correct, since one
+// viewpoint genuinely cannot disambiguate a corridor.
+bool   init_require_motion = true;
+double init_motion_min = 0.50;    // metres of odometry between the two scans
 double init_min_overlap = 0.70;
 double init_overlap_dist = 0.20;  // metres; a point nearer than this is "on the map"
 pcl::KdTreeFLANN<PointType>::Ptr global_map_kdtree;
@@ -975,6 +990,20 @@ bool load_prior_map(const rclcpp::Logger &log)
     return true;
 }
 
+/*** Odometry pose at an init-phase scan, as map-agnostic odom <- IMU.
+ *** Read under init_feats_mutex: the main thread appends to these vectors while
+ *** the search thread reads them, and /relocalize clears them outright. ***/
+bool odom_at(int id, Eigen::Matrix4d &T)
+{
+    std::lock_guard<std::mutex> lk(init_feats_mutex);
+    if (id < 0 || id >= (int)position_init.size() || id >= (int)pose_init.size())
+        return false;
+    T = Eigen::Matrix4d::Identity();
+    T.block<3,3>(0,0) = pose_init[id].toRotationMatrix();
+    T.block<3,1>(0,3) = position_init[id];
+    return true;
+}
+
 /*** Fraction of a scan that lands on the prior map at a proposed pose.
  ***
  *** The agreement check alone is NOT sufficient. MEASURED starting mid-bag in
@@ -1094,6 +1123,20 @@ void global_localization_thread(rclcpp::Logger log)
                             match_id, 100.0 * ov, 100.0 * init_min_overlap);
                 continue;
             }
+            // Motion gate: the new candidate must come from a scan the robot
+            // has actually travelled from, or it is not independent evidence.
+            if (init_require_motion && !ids.empty()) {
+                Eigen::Matrix4d T0, Tn;
+                if (!odom_at(ids[0], T0) || !odom_at(item.first, Tn)) continue;
+                const double moved =
+                    (Tn.block<3,1>(0,3) - T0.block<3,1>(0,3)).norm();
+                if (moved < init_motion_min) {
+                    RCLCPP_INFO(log, "[init] holding: only %.2f m travelled since "
+                                     "the first estimate (need %.2f) -- move the robot",
+                                moved, init_motion_min);
+                    continue;
+                }
+            }
             poses.push_back(T_cand);
             ids.push_back(item.first);
             RCLCPP_INFO(log, "[init] candidate %zu/%d: matched map keyframe %d "
@@ -1102,10 +1145,27 @@ void global_localization_thread(rclcpp::Logger log)
         }
         if ((int)ids.size() < init_agree_count) continue;
 
+        // Each pose is the map pose at ITS OWN scan, so comparing them raw
+        // penalises a correct pair for the distance the robot covered between
+        // them -- the old 2 m tolerance was quietly absorbing that. Transport
+        // each estimate back to the first scan's instant using the odometry
+        // between, and the comparison becomes a true consistency test:
+        //     predicted_0 = pose_i * T_odom(id_i)^-1 * T_odom(id_0)
         double spread = 0.0;
-        for (size_t i = 1; i < poses.size(); ++i)
+        for (size_t i = 1; i < poses.size(); ++i) {
+            Eigen::Matrix4d Pi = poses[i];
+            if (init_require_motion) {
+                Eigen::Matrix4d T0, Ti;
+                if (odom_at(ids[0], T0) && odom_at(ids[i], Ti)) {
+                    Pi = poses[i] * Ti.inverse() * T0;
+                } else {
+                    RCLCPP_WARN(log, "[init] odometry trail unavailable; comparing "
+                                     "estimates uncompensated");
+                }
+            }
             spread = std::max(spread,
-                (poses[i].block<3,1>(0,3) - poses[0].block<3,1>(0,3)).norm());
+                (Pi.block<3,1>(0,3) - poses[0].block<3,1>(0,3)).norm());
+        }
 
         if (spread < init_agree_dist) {
             init_result.first  = ids[0];
@@ -1209,6 +1269,10 @@ public:
         this->get_parameter("localization.sc_dist_thres", sc_dist_thres);
         this->get_parameter("localization.sc_num_ring", sc_num_ring);
         this->get_parameter("localization.sc_num_sector", sc_num_sector);
+        this->declare_parameter<bool>("localization.init_require_motion", true);
+        this->declare_parameter<double>("localization.init_motion_min", 0.50);
+        this->get_parameter("localization.init_require_motion", init_require_motion);
+        this->get_parameter("localization.init_motion_min", init_motion_min);
         this->declare_parameter<double>("localization.init_min_overlap", 0.60);
         this->declare_parameter<double>("localization.init_overlap_dist", 1.0);
         this->get_parameter("localization.init_min_overlap", init_min_overlap);
@@ -1650,12 +1714,16 @@ private:
             // queued alongside the cloud, so the two cannot drift apart.
             if (!global_localization_finish)
             {
-                position_init.push_back(state_point.pos);
-                pose_init.push_back(state_point.rot);
                 PointCloudXYZI::Ptr snapshot(new PointCloudXYZI());
                 pcl::copyPointCloud(*feats_down_body, *snapshot);
                 {
+                    // The trail and the queue are ONE unit: the id queued
+                    // alongside a scan indexes into these vectors, so appending
+                    // outside the lock let the search thread (and /relocalize's
+                    // clear) race against the append.
                     std::lock_guard<std::mutex> lk(init_feats_mutex);
+                    position_init.push_back(state_point.pos);
+                    pose_init.push_back(state_point.rot);
                     // Bounded: ScanContext + two ICP passes is slower than the
                     // scan rate, so an unbounded queue would grow without limit
                     // and the thread would work on ever-staler scans.
