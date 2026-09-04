@@ -1,69 +1,79 @@
-// This is an advanced implementation of the algorithm described in the
-// following paper:
-//   J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time.
-//     Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014.
-
-// Modifier: Livox               dev@livoxtech.com
-
-// Copyright 2013, Ji Zhang, Carnegie Mellon University
-// Further contributions copyright (c) 2016, Southwest Research Institute
-// All rights reserved.
+// FAST-LOCALIZATION for ROS 2 -- localization against a prior map, ported from
+// YWL0720/FAST-LOCALIZATION (ROS 1) onto this workspace's FAST-LIO2.
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
+// WHY THIS EXISTS, AND HOW IT DIFFERS FROM lio_localization.
 //
-// 1. Redistributions of source code must retain the above copyright notice,
-//    this list of conditions and the following disclaimer.
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and/or other materials provided with the distribution.
-// 3. Neither the name of the copyright holder nor the names of its
-//    contributors may be used to endorse or promote products derived from this
-//    software without specific prior written permission.
+// lio_localization keeps FAST-LIO's own map and bolts a SEPARATE ICP node
+// beside it, which registers the scan against a prior .pcd every ~0.5 s and
+// emits a discrete map -> odom correction. That correction is a step, and the
+// step IS the jump: MEASURED on slam_20260823_aligned, 383 correction attempts,
+// 223 rejected by the innovation gate (58%), 100 forced through by the
+// 3-strike escape hatch, the largest 49.72 m, growing over the run -- i.e. it
+// diverged rather than settled. Fitness cannot catch this: inlierFitness is an
+// inlier COUNT at max_corr_dist (1.0 m) while the gate rejects at 0.30 m, so a
+// correction the gate calls implausible costs 0.000 fitness (measured: fitness
+// stays 1.000 out to a full 1.0 m of deliberate offset).
 //
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
+// This node removes the correction entirely. The prior map is loaded straight
+// into the ikd-Tree that FAST-LIO's iEKF registers against, so every scan is
+// constrained by the map INSIDE the filter at scan rate. There is no map->odom
+// step to jump, because there is no separate correction.
+//
+// INITIALIZATION is automatic: ScanContext matches the current scan against the
+// map's keyframe descriptors, then two-stage ICP (5 m then 1 m correspondence)
+// refines against that keyframe's cloud. It is required to agree TWICE within
+// init_agree_dist before being accepted -- a single descriptor hit in a
+// corridor is exactly the confident-wrong-lock this workspace keeps hitting.
+//
+// After the lock the map is READ-ONLY: map_incremental stops, so drifting scans
+// cannot contaminate the prior.
+//
+// MAP FORMAT (built by utils/pgo_to_scancontext_map.py from a PGO run):
+//   <map_dir>/pose.json    one line per keyframe: tx ty tz qw qx qy qz
+//   <map_dir>/pcd/<N>.pcd  that keyframe's cloud, in ITS OWN frame
+//
 #include <omp.h>
 #include <mutex>
+#include <atomic>
+#include <std_srvs/srv/trigger.hpp>
 #include <math.h>
 #include <thread>
 #include <fstream>
 #include <csignal>
+#include <chrono>
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
-#include <ros/ros.h>
+#include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <visualization_msgs/Marker.h>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <tf/transform_datatypes.h>
-#include <tf/transform_broadcaster.h>
-#include <geometry_msgs/Vector3.h>
-#include <livox_ros_driver/CustomMsg.h>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
+#ifdef HAVE_LIVOX
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+#endif
 #include "preprocess.h"
-#include <ikd-Tree/ikd_Tree.h>
-#include <chrono>
-#include <pcl/registration/ndt.h>
-#include <pcl/registration/icp.h>
-#include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include "Scancontext/Scancontext.h"
+#include <pcl/registration/icp.h>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <fstream>
+#include <ikd-Tree/ikd_Tree.h>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -76,6 +86,7 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   publish_tf_en = true;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -86,9 +97,10 @@ double time_diff_lidar_to_imu = 0.0;
 mutex mtx_buffer;
 condition_variable sig_buffer;
 
-int localization_mode;
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+string map_frame, body_frame;
+
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -99,6 +111,7 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
+bool    is_first_lidar = true;
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -107,7 +120,7 @@ vector<double>       extrinT(3, 0.0);
 vector<double>       extrinR(9, 0.0);
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
-deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -117,33 +130,11 @@ PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
-PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
 KD_TREE<PointType> ikdtree;
-KD_TREE<PointType> ikdtree_global;
-KD_TREE<PointType> ikdtree_init;
-
-// scmanager
-SCManager scManager;
-// init cloud vector
-std::mutex init_feats_down_body_mutex;
-std::queue<std::pair<int, PointCloudXYZI::Ptr>> init_feats_down_bodys;
-
-int init_count = 0;
-std::pair<int, Eigen::Matrix4d> init_result;
-std::mutex global_localization_finish_state_mutex;
-bool global_localization_finish = false;
-bool global_update = false;
-
-std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> position_map;
-std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_map;
-
-std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> position_init;
-std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_init;
-
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
 V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
@@ -152,16 +143,73 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
+/*** FAST-LOCALIZATION state ***/
+SCManager scManager;                       // ScanContext descriptor DB of the prior map
+PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
+KD_TREE<PointType> ikdtree_global;         // prior map as an ikd-Tree, swapped in on lock
+std::vector<V3D, Eigen::aligned_allocator<V3D>> position_map;   // keyframe positions (map)
+std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_map;
+// Odometry trail during the init phase. The ScanContext match names a SCAN, not
+// "now", so the pose it yields has to be carried forward by the odometry that
+// accumulated since -- hence keeping the whole trail rather than just the latest.
+std::vector<V3D, Eigen::aligned_allocator<V3D>> position_init;
+std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_init;
+std::queue<std::pair<int, PointCloudXYZI::Ptr>> init_feats_down_bodys;
+std::mutex init_feats_mutex, init_state_mutex;
+bool  global_localization_finish = false;  // a lock has been found
+bool  global_update = false;               // the current lock has been APPLIED
+bool  map_swapped   = false;               // ikdtree already holds the prior map
+std::atomic<bool> relocalize_requested{false};
+int   init_count = 0;
+std::pair<int, Eigen::Matrix4d> init_result;
+std::string map_dir_param;                 // <map_dir> holding pose.json and pcd/
+int    init_agree_count = 2;               // independent locks that must agree
+double init_agree_dist  = 2.0;             // metres they must agree within
+double init_icp_coarse  = 5.0, init_icp_fine = 1.0;
+// ScanContext descriptor geometry -- sized to THIS sensor, not upstream's 64-beam
+// car lidar. See the note in Scancontext.h: the L2's downsampled keyframes are
+// ~1600 pts with 90% inside 2.9 m, so a 80 m radius leaves most of the descriptor
+// empty. Radius is set from the data; rings/sectors are reduced so the bins that
+// remain actually hold points (20x60 = 1200 bins for 1600 points is ~1 pt/bin).
+double sc_lidar_height = 0.5, sc_max_radius = 10.0, sc_dist_thres = 0.15;
+// Minimum fraction of the scan that must land on the prior map, at the pose a
+// candidate proposes, for that candidate to be believed at all.
+// TUNED, not guessed. At 1.0 m tolerance a wrong lock 41 m from truth still
+// scored 97-100%: the map is dense (4.5M pts) and the scan sparse (~1600 pts
+// mostly within 3 m), so indoors almost any pose puts most points within a
+// metre of something. That is the same saturation that made the old stack's
+// ICP fitness useless. At 0.20 m the wrong candidates score 50-67% and the
+// right ones 99-100% -- a clean separation.
+double init_min_overlap = 0.70;
+double init_overlap_dist = 0.20;  // metres; a point nearer than this is "on the map"
+pcl::KdTreeFLANN<PointType>::Ptr global_map_kdtree;
+int    sc_num_ring = 12, sc_num_sector = 40;
+double prior_map_view_leaf = 0.20;   // display-only downsample for /prior_map
+// TF child frame. FAST-LIO natively broadcasts map -> <body_frame>, which here
+// is camera_imu_optical_frame -- the IMU on the mast. That is the wrong thing to
+// hand a bag or nav2 for two reasons: REP-105 wants map -> base_footprint, and
+// the bag's own /tf_static already publishes base_footprint -> camera_imu_-
+// optical_frame, so broadcasting the IMU edge too would give that frame TWO
+// parents and split the tree. Composing the (static) body -> base extrinsic on
+// first lookup and broadcasting map -> base_footprint keeps one parent each.
+std::string tf_child_frame;                 // "" => broadcast body_frame as-is
+bool  tf_child_resolved = false;
+M3D   R_body_to_tfchild(Eye3d);
+V3D   t_body_to_tfchild(0, 0, 0);
+std::shared_ptr<tf2_ros::Buffer> tf_buffer_g;
+std::shared_ptr<tf2_ros::TransformListener> tf_listener_g;
+bool   map_loaded = false;
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 vect3 pos_lid;
 
-nav_msgs::Path path;
-nav_msgs::Odometry odomAftMapped;
-geometry_msgs::Quaternion geoQuat;
-geometry_msgs::PoseStamped msg_body_pose;
+nav_msgs::msg::Path path;
+nav_msgs::msg::Odometry odomAftMapped;
+geometry_msgs::msg::Quaternion geoQuat;
+geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
@@ -169,8 +217,9 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 void SigHandle(int sig)
 {
     flg_exit = true;
-    ROS_WARN("catch sig %d", sig);
+    std::cout << "catch sig %d" << sig << std::endl;
     sig_buffer.notify_all();
+    rclcpp::shutdown();
 }
 
 inline void dump_lio_state_to_log(FILE *fp)  
@@ -302,22 +351,27 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) 
+void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
     mtx_buffer.lock();
     scan_count ++;
+    double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
-    if (msg->header.stamp.toSec() < last_timestamp_lidar)
+    if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        ROS_ERROR("lidar loop back, clear buffer");
+        std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+    }
+    if (is_first_lidar)
+    {
+        is_first_lidar = false;
     }
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
-    time_buffer.push_back(msg->header.stamp.toSec());
-    last_timestamp_lidar = msg->header.stamp.toSec();
+    time_buffer.push_back(cur_time);
+    last_timestamp_lidar = cur_time;
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -325,17 +379,23 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
-void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg) 
+#ifdef HAVE_LIVOX
+void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
 {
     mtx_buffer.lock();
+    double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
-    if (msg->header.stamp.toSec() < last_timestamp_lidar)
+    if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        ROS_ERROR("lidar loop back, clear buffer");
+        std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
     }
-    last_timestamp_lidar = msg->header.stamp.toSec();
+    if(is_first_lidar)
+    {
+        is_first_lidar = false;
+    }
+    last_timestamp_lidar = cur_time;
     
     if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
     {
@@ -358,27 +418,29 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
+#endif // HAVE_LIVOX
 
-void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) 
+void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
-    sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
+    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
+    
 
-    msg->header.stamp = ros::Time().fromSec(msg_in->header.stamp.toSec() - time_diff_lidar_to_imu);
+    msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
     if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
     {
         msg->header.stamp = \
-        ros::Time().fromSec(timediff_lidar_wrt_imu + msg_in->header.stamp.toSec());
+        rclcpp::Time(timediff_lidar_wrt_imu + get_time_sec(msg_in->header.stamp));
     }
 
-    double timestamp = msg->header.stamp.toSec();
+    double timestamp = get_time_sec(msg->header.stamp);
 
     mtx_buffer.lock();
 
     if (timestamp < last_timestamp_imu)
     {
-        ROS_WARN("imu loop back, clear buffer");
+        std::cerr << "lidar loop back, clear buffer" << std::endl;
         imu_buffer.clear();
     }
 
@@ -405,7 +467,7 @@ bool sync_packages(MeasureGroup &meas)
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-            ROS_WARN("Too few input point cloud!\n");
+            std::cerr << "Too few input point cloud!\n";
         }
         else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
         {
@@ -429,11 +491,11 @@ bool sync_packages(MeasureGroup &meas)
     }
 
     /*** push imu data, and pop from imu buffer ***/
-    double imu_time = imu_buffer.front()->header.stamp.toSec();
+    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
     meas.imu.clear();
     while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
     {
-        imu_time = imu_buffer.front()->header.stamp.toSec();
+        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
         if(imu_time > lidar_end_time) break;
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
@@ -495,9 +557,9 @@ void map_incremental()
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
 
-PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
+PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
+void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
     if(scan_pub_en)
     {
@@ -512,17 +574,19 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
                                 &laserCloudWorld->points[i]);
         }
 
-        sensor_msgs::PointCloud2 laserCloudmsg;
+        sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
-        pubLaserCloudFull.publish(laserCloudmsg);
+        // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+        laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+        laserCloudmsg.header.frame_id = map_frame;
+        pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
+    /*
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -549,9 +613,10 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
             scan_wait_num = 0;
         }
     }
+    */
 }
 
-void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
+void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
 {
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
@@ -562,15 +627,15 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
                             &laserCloudIMUBody->points[i]);
     }
 
-    sensor_msgs::PointCloud2 laserCloudmsg;
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
-    laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
-    pubLaserCloudFull_body.publish(laserCloudmsg);
+    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+    laserCloudmsg.header.frame_id = body_frame;
+    pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
 
-void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
+void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(effct_feat_num, 1));
@@ -579,20 +644,45 @@ void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
         RGBpointBodyToWorld(&laserCloudOri->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    sensor_msgs::PointCloud2 laserCloudFullRes3;
+    sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
-    laserCloudFullRes3.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
-    pubLaserCloudEffect.publish(laserCloudFullRes3);
+    laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
+    laserCloudFullRes3.header.frame_id = map_frame;
+    pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(const ros::Publisher & pubLaserCloudMap)
+void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
-    sensor_msgs::PointCloud2 laserCloudMap;
-    pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudMap.header.frame_id = "camera_init";
-    pubLaserCloudMap.publish(laserCloudMap);
+    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
+    int size = laserCloudFullRes->points.size();
+    PointCloudXYZI::Ptr laserCloudWorld( \
+                    new PointCloudXYZI(size, 1));
+
+    for (int i = 0; i < size; i++)
+    {
+        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
+                            &laserCloudWorld->points[i]);
+    }
+    *pcl_wait_pub += *laserCloudWorld;
+
+    sensor_msgs::msg::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
+    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+    laserCloudmsg.header.frame_id = map_frame;
+    pubLaserCloudMap->publish(laserCloudmsg);
+
+    // sensor_msgs::msg::PointCloud2 laserCloudMap;
+    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
+    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
+    // laserCloudMap.header.frame_id = "camera_init";
+    // pubLaserCloudMap->publish(laserCloudMap);
+}
+
+void save_to_pcd()
+{
+    pcl::PCDWriter pcd_writer;
+    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
 
 template<typename T>
@@ -608,13 +698,28 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const ros::Publisher & pubOdomAftMapped)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
+    odomAftMapped.header.frame_id = map_frame;
+    odomAftMapped.child_frame_id = body_frame;
+    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
+
+    // Linear velocity: state_point.vel is the IKFOM state's own filtered
+    // velocity estimate (get_f() integrates it straight into pos, i.e. it's
+    // expressed in the map/world frame). nav_msgs/Odometry's twist is
+    // conventionally in child_frame_id (body frame, REP 103), so rotate it
+    // by the inverse of the current orientation before publishing.
+    // This is populated so downstream consumers get the EKF's own smoothed
+    // velocity instead of differencing consecutive /Odometry poses
+    // themselves -- differencing amplifies the ~1-2cm scan-matching jitter
+    // into a badly noisy velocity (same effect that inflated raw-rate
+    // "distance traveled" 2x in the travel-distance analysis).
+    vect3 vel_body = state_point.rot.conjugate() * state_point.vel;
+    odomAftMapped.twist.twist.linear.x = vel_body[0];
+    odomAftMapped.twist.twist.linear.y = vel_body[1];
+    odomAftMapped.twist.twist.linear.z = vel_body[2];
+
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -626,34 +731,88 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    // vel occupies state indices 12-14 (see use-ikfom.hpp / get_f: res(i+12)
+    // is vel's derivative) -- this is the world-frame vel covariance, not
+    // rotated to match vel_body above, but still a useful relative measure
+    // of how well-determined the velocity estimate currently is.
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            odomAftMapped.twist.covariance[i*6 + j] = P(12 + i, 12 + j);
 
-    static tf::TransformBroadcaster br;
-    tf::Transform                   transform;
-    tf::Quaternion                  q;
-    transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
-                                    odomAftMapped.pose.pose.position.y, \
-                                    odomAftMapped.pose.pose.position.z));
-    q.setW(odomAftMapped.pose.pose.orientation.w);
-    q.setX(odomAftMapped.pose.pose.orientation.x);
-    q.setY(odomAftMapped.pose.pose.orientation.y);
-    q.setZ(odomAftMapped.pose.pose.orientation.z);
-    transform.setRotation( q );
-    br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+    // publish only once every field above is populated -- previously this
+    // call happened before the covariance loop, so every message shipped
+    // the PREVIOUS cycle's covariance instead of its own.
+    pubOdomAftMapped->publish(odomAftMapped);
+
+    if (publish_tf_en)
+    {
+        geometry_msgs::msg::TransformStamped trans;
+        trans.header.frame_id = map_frame;
+        trans.header.stamp = odomAftMapped.header.stamp;
+
+        // Resolve body -> tf_child once. It is a STATIC extrinsic, so a single
+        // successful lookup is cached for the life of the node; until it
+        // succeeds nothing is broadcast, because a map -> base edge computed
+        // from a missing extrinsic would be silently wrong rather than absent.
+        if (!tf_child_frame.empty() && tf_child_frame != body_frame) {
+            if (!tf_child_resolved) {
+                if (!tf_buffer_g) return;
+                try {
+                    auto tfs = tf_buffer_g->lookupTransform(
+                        body_frame, tf_child_frame, tf2::TimePointZero);
+                    const auto &q = tfs.transform.rotation;
+                    const auto &v = tfs.transform.translation;
+                    Eigen::Quaterniond eq(q.w, q.x, q.y, q.z);
+                    R_body_to_tfchild = eq.toRotationMatrix();
+                    t_body_to_tfchild = V3D(v.x, v.y, v.z);
+                    tf_child_resolved = true;
+                } catch (const tf2::TransformException &) {
+                    return;      // extrinsic not up yet; try again next scan
+                }
+            }
+            const Eigen::Quaterniond q_mb(odomAftMapped.pose.pose.orientation.w,
+                                          odomAftMapped.pose.pose.orientation.x,
+                                          odomAftMapped.pose.pose.orientation.y,
+                                          odomAftMapped.pose.pose.orientation.z);
+            const M3D R_mb = q_mb.toRotationMatrix();
+            const V3D p_mb(odomAftMapped.pose.pose.position.x,
+                           odomAftMapped.pose.pose.position.y,
+                           odomAftMapped.pose.pose.position.z);
+            const M3D R_mc = R_mb * R_body_to_tfchild;
+            const V3D p_mc = R_mb * t_body_to_tfchild + p_mb;
+            const Eigen::Quaterniond q_mc(R_mc);
+            trans.child_frame_id = tf_child_frame;
+            trans.transform.translation.x = p_mc(0);
+            trans.transform.translation.y = p_mc(1);
+            trans.transform.translation.z = p_mc(2);
+            trans.transform.rotation.w = q_mc.w();
+            trans.transform.rotation.x = q_mc.x();
+            trans.transform.rotation.y = q_mc.y();
+            trans.transform.rotation.z = q_mc.z();
+        } else {
+            trans.child_frame_id = body_frame;
+            trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+            trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+            trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+            trans.transform.rotation = odomAftMapped.pose.pose.orientation;
+        }
+        tf_br->sendTransform(trans);
+    }
 }
 
-void publish_path(const ros::Publisher pubPath)
+void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
+    msg_body_pose.header.frame_id = map_frame;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
-//    jjj++;
+    jjj++;
     if (jjj % 10 == 0) 
     {
         path.poses.push_back(msg_body_pose);
-        pubPath.publish(path);
+        pubPath->publish(path);
     }
 }
 
@@ -730,7 +889,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
-        ROS_WARN("No Effective Points! \n");
+        std::cerr << "No Effective Points!" << std::endl;
+        // ROS_WARN("No Effective Points! \n");
         return;
     }
 
@@ -775,321 +935,532 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
-void load_file(ros::Publisher& global_map_pub)
+
+/*** Load the prior map: per-keyframe clouds + their poses, and build the
+ *** ScanContext descriptor DB. Clouds are stored in their OWN frame (that is
+ *** what ScanContext needs -- a descriptor of the local structure as seen from
+ *** that pose), and transformed into map only when accumulating global_map. ***/
+bool load_prior_map(const rclcpp::Logger &log)
 {
-    fstream pose_file;
-    pose_file.open(root_dir + "map/pose.json");
+    const std::string pose_path = map_dir_param + "/pose.json";
+    std::ifstream pose_file(pose_path);
+    if (!pose_file.is_open()) {
+        RCLCPP_ERROR(log, "cannot open %s", pose_path.c_str());
+        return false;
+    }
     double tx, ty, tz, w, x, y, z;
     int count = 0;
-    while(pose_file >> tx >> ty >> tz >> w >> x >> y >> z)
+    while (pose_file >> tx >> ty >> tz >> w >> x >> y >> z)
     {
         Eigen::Quaterniond q(w, x, y, z);
-        Eigen::Vector3d p(tx, ty, tz);
-        position_map.push_back(p);
+        q.normalize();
+        V3D pos(tx, ty, tz);
+        const std::string pcd = map_dir_param + "/pcd/" + std::to_string(count) + ".pcd";
+        PointCloudXYZI::Ptr temp(new PointCloudXYZI());
+        if (pcl::io::loadPCDFile(pcd, *temp) < 0) {
+            RCLCPP_ERROR(log, "cannot read %s (pose.json has %d entries so far)",
+                         pcd.c_str(), count);
+            return false;
+        }
+        position_map.push_back(pos);
         pose_map.push_back(q);
-        pcl::PointCloud<pcl::PointXYZINormal>::Ptr temp(new pcl::PointCloud<pcl::PointXYZINormal>);
-        pcl::io::loadPCDFile(root_dir + "map/pcd/" + to_string(count) + ".pcd", *temp);
-        scManager.makeAndSaveScancontextAndKeys(*temp);
-        pcl::transformPointCloud(*temp, *temp, p, q);
-        *global_map += *temp;
-        sensor_msgs::PointCloud2 msg_global;
-        pcl::toROSMsg(*temp, msg_global);
-        msg_global.header.frame_id = "camera_init";
-        msg_global.header.stamp = ros::Time::now();
-        global_map_pub.publish(msg_global);
+        scManager.makeAndSaveScancontextAndKeys(*temp);   // in the keyframe's own frame
+        PointCloudXYZI::Ptr in_map(new PointCloudXYZI());
+        pcl::transformPointCloud(*temp, *in_map, pos, q);
+        *global_map += *in_map;
         count++;
     }
-    pose_file.close();
-
+    if (count == 0) { RCLCPP_ERROR(log, "%s is empty", pose_path.c_str()); return false; }
+    RCLCPP_INFO(log, "Prior map: %d keyframes, %zu pts", count, global_map->size());
+    return true;
 }
 
-void global_localization()
+/*** Fraction of a scan that lands on the prior map at a proposed pose.
+ ***
+ *** The agreement check alone is NOT sufficient. MEASURED starting mid-bag in
+ *** the corridor: ScanContext matched keyframes 203 and 191, which are adjacent
+ *** to each other near the origin, so the two estimates agreed to 1.86 m and
+ *** passed a 2 m limit -- while the robot was 41 m away. Two wrong matches to
+ *** the same wrong place agree with each other perfectly. Agreement measures
+ *** self-consistency, not correctness.
+ ***
+ *** This asks the map instead: put the scan where the candidate says, and see
+ *** how much of it lands on something. A pose 41 m out overlaps almost nothing,
+ *** and no amount of internal consistency can fake that. ***/
+double map_overlap(const PointCloudXYZI::Ptr &scan_body, const Eigen::Matrix4d &T_map_body)
 {
-    ros::Rate rate(20);
-    while (ros::ok())
+    if (!global_map_kdtree || scan_body->empty()) return 0.0;
+    PointCloudXYZI::Ptr in_map(new PointCloudXYZI());
+    pcl::transformPointCloud(*scan_body, *in_map, T_map_body.cast<float>());
+    const double r2 = init_overlap_dist * init_overlap_dist;
+    std::vector<int> idx(1); std::vector<float> d2(1);
+    size_t hit = 0;
+    for (const auto &pt : in_map->points) {
+        if (global_map_kdtree->nearestKSearch(pt, 1, idx, d2) > 0 && d2[0] <= r2) ++hit;
+    }
+    return double(hit) / double(in_map->size());
+}
+
+/*** Background thread: find where we are, using ScanContext + ICP.
+ ***
+ *** Runs only until a lock is accepted. It consumes the undistorted scans the
+ *** main loop queues during the init phase, and requires init_agree_count
+ *** independent locks agreeing within init_agree_dist -- one descriptor hit in a
+ *** corridor is not evidence, several that agree are. ***/
+void global_localization_thread(rclcpp::Logger log)
+{
+    rclcpp::Rate rate(20);
+    while (rclcpp::ok())
     {
-        std::unique_lock<std::mutex> lock_state(global_localization_finish_state_mutex);
-        bool global_localization_finish_state = global_localization_finish;
-        lock_state.unlock();
-
-        if (global_localization_finish_state)
-            continue;
-
-        // 初始化检查 两次成功初始化 位置增量小于阈值时通过检查
-        int init_check = 0;
-        // 重定位结果
-        std::vector<int> init_ids;
-        std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> init_poses;
-        while (init_check < 2)
+        bool already_locked;
         {
-            std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
-            int N = init_feats_down_bodys.size();
-            lock_init_feats.unlock();
-            if (N != 0)
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            already_locked = global_localization_finish;
+        }
+        // Idle, not finished: /relocalize clears this flag to re-arm the search,
+        // so returning here would make relocalization impossible for the life
+        // of the process.
+        if (already_locked) { rate.sleep(); continue; }
+        if (!map_loaded) { rate.sleep(); continue; }
+
+        std::vector<int> ids;
+        std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
+        while ((int)ids.size() < init_agree_count && rclcpp::ok())
+        {
+            std::pair<int, PointCloudXYZI::Ptr> item;
             {
-                // 获得初始化阶段去畸变后的当前帧点云
-                lock_init_feats.lock();
-                auto init_pair = init_feats_down_bodys.front();
-                init_feats_down_bodys.pop();
-                lock_init_feats.unlock();
-
-                int current_init_id = init_pair.first;
-                PointCloudXYZI::Ptr current_init_pc_origin = init_pair.second;
-                PointCloudXYZI::Ptr current_init_pc(new PointCloudXYZI);
-                pcl::copyPointCloud(*current_init_pc_origin, *current_init_pc);
-
-                scManager.makeAndSaveScancontextAndKeys(*current_init_pc);
-                // 获得全局定位ID
-                int localization_id = scManager.detectLoopClosureID().first;
-                float yaw_init = scManager.detectLoopClosureID().second;
-
-                if (localization_id == -1)
-                {
-                    init_check = 0;
-                    continue;
-                }
-
-                Eigen::AngleAxisd yaw(-yaw_init, Eigen::Vector3d(0, 0, 1));
-                Eigen::Matrix4d T_init_sc = Eigen::Matrix4d::Identity();
-                T_init_sc.block<3, 3>(0, 0) = Eigen::Matrix3d(yaw);
-                pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_init_sc);
-                ROS_INFO("Global match map id = %d", localization_id);
-                // 加载匹配地图帧 及 状态
-                PointCloudXYZI::Ptr current_loop_pc(new PointCloudXYZI);
-                pcl::io::loadPCDFile(root_dir + "map/pcd/" + to_string(localization_id) + ".pcd", *current_loop_pc);
-                Eigen::Vector3d p = position_map[localization_id];
-                Eigen::Quaterniond q = pose_map[localization_id];
-
-                Eigen::Matrix4d T_corr = Eigen::Matrix4d::Identity();
-
-
-                pcl::IterativeClosestPoint<PointType, PointType> icp;
-                icp.setMaxCorrespondenceDistance(5);
-
-                icp.setInputSource(current_init_pc);
-                icp.setInputTarget(current_loop_pc);
-                pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>);
-                icp.align(*unused);
-                Eigen::Matrix4d T_corr_current = icp.getFinalTransformation().cast<double>();
-                pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_corr_current);
-                T_corr = T_corr_current * T_init_sc;
-
-                icp.setMaxCorrespondenceDistance(1);
-
-                icp.setInputSource(current_init_pc);
-                icp.setInputTarget(current_loop_pc);
-                icp.align(*unused);
-                T_corr_current = icp.getFinalTransformation().cast<double>();
-                pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_corr_current);
-                T_corr = (T_corr_current * T_corr).eval();
-
-                cout << T_corr << endl;
-
-                Eigen::Matrix4d T_or = Eigen::Matrix4d::Identity();
-                T_or.block<3, 3>(0, 0) = q.toRotationMatrix();
-                T_or.block<3, 1>(0, 3) = p;
-
-                Eigen::Matrix4d T_i_l = Eigen::Matrix4d::Identity();
-                T_i_l.block<3, 3>(0, 0) = Lidar_R_wrt_IMU;
-                T_i_l.block<3, 1>(0, 3) = Lidar_T_wrt_IMU;
-
-                Eigen::Matrix4d T = T_or * T_corr * T_i_l.inverse();
-
-                init_poses.push_back(T);
-                init_ids.push_back(current_init_id);
-                scManager.dropBackScancontextAndKeys();
-                init_check++;
+                std::lock_guard<std::mutex> lk(init_feats_mutex);
+                if (init_feats_down_bodys.empty()) { item.second = nullptr; }
+                else { item = init_feats_down_bodys.front(); init_feats_down_bodys.pop(); }
             }
-        }
+            if (!item.second) { rate.sleep(); continue; }
 
-        Eigen::Vector3d pos_diff = init_poses[0].block<3, 1>(0, 3) - init_poses[1].block<3, 1>(0, 3);
-        if (pos_diff.norm() < 2)
-        {
-            lock_state.lock();
-            global_localization_finish = true;
-            lock_state.unlock();
-            ROS_INFO("Global localization successfully");
-            init_result.first = init_ids[0];
-            init_result.second = init_poses[0];
-            std::queue<std::pair<int, PointCloudXYZI::Ptr>> swap_empty;
-            std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
-            swap(init_feats_down_bodys, swap_empty);
-            lock_init_feats.unlock();
+            PointCloudXYZI::Ptr scan(new PointCloudXYZI());
+            pcl::copyPointCloud(*item.second, *scan);
+
+            scManager.makeAndSaveScancontextAndKeys(*scan);
+            auto hit = scManager.detectLoopClosureID();
+            const int   match_id = hit.first;
+            const float yaw_init = hit.second;
+            scManager.dropBackScancontextAndKeys();       // do not grow the DB with live scans
+            if (match_id == -1) { continue; }
+
+            // ScanContext resolves yaw only; undo it, then ICP for the rest.
+            Eigen::Matrix4d T_sc = Eigen::Matrix4d::Identity();
+            T_sc.block<3,3>(0,0) = Eigen::Matrix3d(
+                Eigen::AngleAxisd(-yaw_init, V3D(0,0,1)));
+            pcl::transformPointCloud(*scan, *scan, T_sc);
+
+            PointCloudXYZI::Ptr kf_cloud(new PointCloudXYZI());
+            const std::string kf_pcd = map_dir_param + "/pcd/" + std::to_string(match_id) + ".pcd";
+            if (pcl::io::loadPCDFile(kf_pcd, *kf_cloud) < 0) { continue; }
+
+            // Coarse then fine: the coarse pass has to survive a ScanContext hit
+            // that is the right PLACE but metres off; the fine pass is the answer.
+            Eigen::Matrix4d T_corr = T_sc;
+            pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>());
+            for (double maxd : {init_icp_coarse, init_icp_fine}) {
+                pcl::IterativeClosestPoint<PointType, PointType> icp;
+                icp.setMaxCorrespondenceDistance(maxd);
+                icp.setInputSource(scan);
+                icp.setInputTarget(kf_cloud);
+                icp.align(*unused);
+                if (!icp.hasConverged()) { T_corr.setZero(); break; }
+                Eigen::Matrix4d Ti = icp.getFinalTransformation().cast<double>();
+                pcl::transformPointCloud(*scan, *scan, Ti);
+                T_corr = (Ti * T_corr).eval();
+            }
+            if (T_corr.isZero()) { continue; }
+
+            Eigen::Matrix4d T_kf = Eigen::Matrix4d::Identity();
+            T_kf.block<3,3>(0,0) = pose_map[match_id].toRotationMatrix();
+            T_kf.block<3,1>(0,3) = position_map[match_id];
+
+            Eigen::Matrix4d T_i_l = Eigen::Matrix4d::Identity();
+            T_i_l.block<3,3>(0,0) = Lidar_R_wrt_IMU;
+            T_i_l.block<3,1>(0,3) = Lidar_T_wrt_IMU;
+
+            // map <- IMU at the scan this estimate came from
+            const Eigen::Matrix4d T_cand = T_kf * T_corr * T_i_l.inverse();
+
+            // Does the scan actually fit the map there? Checked against the
+            // ORIGINAL scan, not the ICP-transformed copy, and in the lidar
+            // frame the pose describes.
+            const Eigen::Matrix4d T_cand_lidar = T_cand * T_i_l;
+            const double ov = map_overlap(item.second, T_cand_lidar);
+            if (ov < init_min_overlap) {
+                RCLCPP_WARN(log, "[init] discarded keyframe %d: only %.0f%% of the "
+                                 "scan lands on the map there (need %.0f%%)",
+                            match_id, 100.0 * ov, 100.0 * init_min_overlap);
+                continue;
+            }
+            poses.push_back(T_cand);
+            ids.push_back(item.first);
+            RCLCPP_INFO(log, "[init] candidate %zu/%d: matched map keyframe %d "
+                             "(%.0f%% overlap)",
+                        ids.size(), init_agree_count, match_id, 100.0 * ov);
         }
-        else
-        {
-            init_ids.clear();
-            init_poses.clear();
+        if ((int)ids.size() < init_agree_count) continue;
+
+        double spread = 0.0;
+        for (size_t i = 1; i < poses.size(); ++i)
+            spread = std::max(spread,
+                (poses[i].block<3,1>(0,3) - poses[0].block<3,1>(0,3)).norm());
+
+        if (spread < init_agree_dist) {
+            init_result.first  = ids[0];
+            init_result.second = poses[0];
+            {
+                std::lock_guard<std::mutex> lk(init_state_mutex);
+                global_localization_finish = true;
+            }
+            {
+                std::lock_guard<std::mutex> lk(init_feats_mutex);
+                std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
+                std::swap(init_feats_down_bodys, empty);
+            }
+            RCLCPP_INFO(log, "[init] LOCKED: %d estimates agree to %.2f m (limit %.2f)",
+                        init_agree_count, spread, init_agree_dist);
+            continue;   // idle until /relocalize re-arms us
         }
-        rate.sleep();
+        RCLCPP_WARN(log, "[init] rejected: estimates disagree by %.2f m (limit %.2f) "
+                         "-- ambiguous place, retrying", spread, init_agree_dist);
+        ids.clear(); poses.clear();
     }
 }
 
-int main(int argc, char** argv)
+class LaserMappingNode : public rclcpp::Node
 {
-    ros::init(argc, argv, "laserMapping");
-    ros::NodeHandle nh;
-
-    nh.param<bool>("publish/path_en",path_en, true);
-    nh.param<int>("common/localization_mode", localization_mode, 1);
-    nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
-    nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
-    nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
-    nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
-    nh.param<string>("map_file_path",map_file_path,"");
-    nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
-    nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
-    nh.param<bool>("common/time_sync_en", time_sync_en, false);
-    nh.param<double>("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
-    nh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
-    nh.param<double>("filter_size_surf",filter_size_surf_min,0.5);
-    nh.param<double>("filter_size_map",filter_size_map_min,0.5);
-    nh.param<double>("cube_side_length",cube_len,200);
-    nh.param<float>("mapping/det_range",DET_RANGE,300.f);
-    nh.param<double>("mapping/fov_degree",fov_deg,180);
-    nh.param<double>("mapping/gyr_cov",gyr_cov,0.1);
-    nh.param<double>("mapping/acc_cov",acc_cov,0.1);
-    nh.param<double>("mapping/b_gyr_cov",b_gyr_cov,0.0001);
-    nh.param<double>("mapping/b_acc_cov",b_acc_cov,0.0001);
-    nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
-    nh.param<int>("preprocess/lidar_type", p_pre->lidar_type, AVIA);
-    nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 16);
-    nh.param<int>("preprocess/timestamp_unit", p_pre->time_unit, US);
-    nh.param<int>("preprocess/scan_rate", p_pre->SCAN_RATE, 10);
-    nh.param<int>("point_filter_num", p_pre->point_filter_num, 2);
-    nh.param<bool>("feature_extract_enable", p_pre->feature_enabled, false);
-    nh.param<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
-    nh.param<bool>("mapping/extrinsic_est_en", extrinsic_est_en, true);
-    nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
-    nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
-    nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
-    nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
-    cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
-    
-    path.header.stamp    = ros::Time::now();
-    path.header.frame_id ="camera_init";
-
-    /*** variables definition ***/
-    int effect_feat_num = 0, frame_num = 0;
-    double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
-    bool flg_EKF_converged, EKF_stop_flg = 0;
-    
-    FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
-    HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
-
-    _featsArray.reset(new PointCloudXYZI());
-
-    memset(point_selected_surf, true, sizeof(point_selected_surf));
-    memset(res_last, -1000.0f, sizeof(res_last));
-    downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
-    downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-    memset(point_selected_surf, true, sizeof(point_selected_surf));
-    memset(res_last, -1000.0f, sizeof(res_last));
-
-    Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
-    Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
-    p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
-    p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
-    p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
-    p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
-    p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
-
-    double epsi[23] = {0.001};
-    fill(epsi, epsi+23, 0.001);
-    kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
-
-    /*** debug record ***/
-    FILE *fp;
-    string pos_log_dir = root_dir + "/Log/pos_log.txt";
-    fp = fopen(pos_log_dir.c_str(),"w");
-
-    ofstream fout_pre, fout_out, fout_dbg;
-    fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-    fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-    fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-    if (fout_pre && fout_out)
-        cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
-    else
-        cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
-
-    /*** ROS subscribe initialization ***/
-    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
-        nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
-        nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
-    ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
-    ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
-            ("/cloud_registered", 100000);
-    ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
-            ("/cloud_registered_body", 100000);
-    ros::Publisher pubLaserCloudEffect = nh.advertise<sensor_msgs::PointCloud2>
-            ("/cloud_effected", 100000);
-    ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
-            ("/Laser_map", 100000);
-    ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
-            ("/Odometry", 100000);
-    ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
-            ("/path", 100000);
-    ros::Publisher pubGlobalMap     = nh.advertise<sensor_msgs::PointCloud2>
-            ("/global_map", 1);
-//------------------------------------------------------------------------------------------------------
-    signal(SIGINT, SigHandle);
-    ros::Rate rate(5000);
-    bool status = ros::ok();
-
-    // load global map
-    ROS_INFO("Press any key to load map");
-    getchar();
-    // load pcd and build map sc
-    load_file(pubGlobalMap);
-    // build global ikdtree
-    ikdtree_global.set_downsample_param(filter_size_map_min);
-    ikdtree_global.Build(global_map->points);
-    ROS_INFO("Load map successfully");
-    // 全局定位线程
-    std::thread global_localization_thread(global_localization);
-    while (status)
+public:
+    LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("fast_lio_localization", options)
     {
-        if (flg_exit) break;
-        ros::spinOnce();
-        if(sync_packages(Measures)) 
+        this->declare_parameter<bool>("publish.path_en", true);
+        this->declare_parameter<bool>("publish.effect_map_en", false);
+        this->declare_parameter<bool>("publish.map_en", false);
+        this->declare_parameter<bool>("publish.scan_publish_en", true);
+        this->declare_parameter<bool>("publish.dense_publish_en", true);
+        this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<int>("max_iteration", 4);
+        this->declare_parameter<string>("map_file_path", "");
+        this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
+        this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<bool>("common.time_sync_en", false);
+        this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
+        this->declare_parameter<double>("filter_size_corner", 0.5);
+        this->declare_parameter<double>("filter_size_surf", 0.5);
+        this->declare_parameter<double>("filter_size_map", 0.5);
+        this->declare_parameter<double>("cube_side_length", 200.);
+        this->declare_parameter<float>("mapping.det_range", 300.);
+        this->declare_parameter<double>("mapping.fov_degree", 180.);
+        this->declare_parameter<double>("mapping.gyr_cov", 0.1);
+        this->declare_parameter<double>("mapping.acc_cov", 0.1);
+        this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
+        this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
+        this->declare_parameter<double>("preprocess.blind", 0.01);
+        this->declare_parameter<int>("preprocess.lidar_type", AVIA);
+        this->declare_parameter<int>("preprocess.scan_line", 16);
+        this->declare_parameter<int>("preprocess.timestamp_unit", US);
+        this->declare_parameter<int>("preprocess.scan_rate", 10);
+        this->declare_parameter<int>("point_filter_num", 2);
+        this->declare_parameter<bool>("feature_extract_enable", false);
+        this->declare_parameter<bool>("runtime_pos_log_enable", false);
+        this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+        this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
+        this->declare_parameter<int>("pcd_save.interval", -1);
+        this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<bool>("publish.publish_tf", true);
+        this->declare_parameter<string>("publish.map_frame", "camera_init");
+        this->declare_parameter<string>("publish.body_frame", "body");
+
+        this->get_parameter_or<bool>("publish.path_en", path_en, true);
+        this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
+        this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
+        this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
+        this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
+        this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
+        this->get_parameter_or<string>("map_file_path", map_file_path, "");
+        this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
+        this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
+        this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
+        this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+        this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
+        this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
+        this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
+        // FAST-LOCALIZATION parameters
+        this->declare_parameter<std::string>("localization.map_dir", "");
+        this->declare_parameter<int>("localization.init_agree_count", 2);
+        this->declare_parameter<double>("localization.init_agree_dist", 2.0);
+        this->declare_parameter<double>("localization.init_icp_coarse", 5.0);
+        this->declare_parameter<double>("localization.init_icp_fine", 1.0);
+        this->get_parameter("localization.map_dir", map_dir_param);
+        this->get_parameter("localization.init_agree_count", init_agree_count);
+        this->get_parameter("localization.init_agree_dist", init_agree_dist);
+        this->get_parameter("localization.init_icp_coarse", init_icp_coarse);
+        this->get_parameter("localization.init_icp_fine", init_icp_fine);
+        this->declare_parameter<double>("localization.sc_lidar_height", 0.5);
+        this->declare_parameter<double>("localization.sc_max_radius", 10.0);
+        this->declare_parameter<double>("localization.sc_dist_thres", 0.15);
+        this->declare_parameter<int>("localization.sc_num_ring", 12);
+        this->declare_parameter<int>("localization.sc_num_sector", 40);
+        this->get_parameter("localization.sc_lidar_height", sc_lidar_height);
+        this->get_parameter("localization.sc_max_radius", sc_max_radius);
+        this->get_parameter("localization.sc_dist_thres", sc_dist_thres);
+        this->get_parameter("localization.sc_num_ring", sc_num_ring);
+        this->get_parameter("localization.sc_num_sector", sc_num_sector);
+        this->declare_parameter<double>("localization.init_min_overlap", 0.60);
+        this->declare_parameter<double>("localization.init_overlap_dist", 1.0);
+        this->get_parameter("localization.init_min_overlap", init_min_overlap);
+        this->get_parameter("localization.init_overlap_dist", init_overlap_dist);
+        this->declare_parameter<double>("localization.prior_map_view_leaf", 0.20);
+        this->get_parameter("localization.prior_map_view_leaf", prior_map_view_leaf);
+        this->declare_parameter<std::string>("publish.tf_child_frame", "base_footprint");
+        this->get_parameter("publish.tf_child_frame", tf_child_frame);
+        tf_buffer_g = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_g = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_g, this);
+        this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
+        this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
+        this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
+        this->get_parameter_or<double>("mapping.gyr_cov",gyr_cov,0.1);
+        this->get_parameter_or<double>("mapping.acc_cov",acc_cov,0.1);
+        this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
+        this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
+        this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
+        this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
+        this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
+        this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
+        this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+        this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
+        this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
+        this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+        this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
+        this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
+        this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
+        this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<bool>("publish.publish_tf", publish_tf_en, true);
+        this->get_parameter_or<string>("publish.map_frame", map_frame, "camera_init");
+        this->get_parameter_or<string>("publish.body_frame", body_frame, "body");
+
+        RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
+
+        path.header.stamp = this->get_clock()->now();
+        path.header.frame_id = map_frame;
+
+        // /*** variables definition ***/
+        // int effect_feat_num = 0, frame_num = 0;
+        // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
+        // bool flg_EKF_converged, EKF_stop_flg = 0;
+
+        FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
+        HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
+
+        _featsArray.reset(new PointCloudXYZI());
+
+        memset(point_selected_surf, true, sizeof(point_selected_surf));
+        memset(res_last, -1000.0f, sizeof(res_last));
+        downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+        downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
+        memset(point_selected_surf, true, sizeof(point_selected_surf));
+        memset(res_last, -1000.0f, sizeof(res_last));
+
+        Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
+        Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
+        p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+        p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
+        p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
+        p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
+        p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+
+        fill(epsi, epsi+23, 0.001);
+        kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+
+        /*** debug record ***/
+        // FILE *fp;
+        string pos_log_dir = root_dir + "/Log/pos_log.txt";
+        fp = fopen(pos_log_dir.c_str(),"w");
+
+        // ofstream fout_pre, fout_out, fout_dbg;
+        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
+        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
+        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
+        if (fout_pre && fout_out)
+            cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
+        else
+            cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+
+        /*** ROS subscribe initialization ***/
+#ifdef HAVE_LIVOX
+        if (p_pre->lidar_type == AVIA)
         {
-            // 检查是否需要更新全局定位
-            std::unique_lock<std::mutex> lock_state(global_localization_finish_state_mutex);
-            if (global_localization_finish && !global_update)
-            {
-                int init_id = init_result.first;
-                Eigen::Vector3d init_time_p = position_init[init_id];
-                Eigen::Quaterniond init_time_q = pose_init[init_id];
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+        }
+        else
+#endif
+        {
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+        }
+        // SensorDataQoS (BEST_EFFORT), not a plain depth. A plain depth yields
+        // the DEFAULT profile, i.e. RELIABLE, and a RELIABLE subscriber matches
+        // NOTHING against a BEST_EFFORT publisher -- which is what every real
+        // IMU driver offers, l2lidar_node included. rmw then silently delivers
+        // no IMU at all: FAST-LIO waits forever for IMU init, never emits
+        // /Odometry, and prints no error. The lidar subscription above already
+        // used SensorDataQoS, which is why /points worked while /imu/data did
+        // not, and why this only ever showed up as a broken TF tree
+        // (odom -> base_footprint missing, because lio_odom_bridge had no
+        // odometry to close it with).
+        //
+        // This was masked on bag replay by config/play_qos.yaml, which
+        // re-offers /imu/data as RELIABLE. There is no such override when the
+        // driver is live, so the bug only appeared on the real robot.
+        // BEST_EFFORT readers match BOTH kinds of writer, so this is strictly
+        // more compatible than what it replaces.
+        //
+        // keep_last(200): SensorDataQoS defaults to depth 5, far too shallow
+        // for a 250 Hz IMU feeding a mapping loop that stalls for tens of ms.
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            imu_topic, rclcpp::SensorDataQoS().keep_last(200), imu_cbk);
+        pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
+        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
+        pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
+        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-                Eigen::Matrix4d T_odom_init_time = Eigen::Matrix4d::Identity();
-                T_odom_init_time.block<3, 3>(0, 0) = init_time_q.toRotationMatrix();
-                T_odom_init_time.block<3, 1>(0, 3) = init_time_p;
+        //------------------------------------------------------------------------------------------------------
+        auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
+        // Load the prior map and arm the search BEFORE the scan pipeline starts,
+        // so no scan is processed against an empty map. A missing or unreadable
+        // map is fatal here: this node localizes, it has nothing to do without one.
+        if (map_dir_param.empty()) {
+            RCLCPP_FATAL(this->get_logger(),
+                "localization.map_dir is required -- point it at a directory "
+                "holding pose.json and pcd/.");
+            throw std::runtime_error("localization.map_dir not set");
+        }
+        // Before load_prior_map: the map DB and the live scans must be described
+        // with identical geometry or the descriptors are not comparable at all.
+        scManager.set_geometry(sc_lidar_height, sc_max_radius,
+                               sc_num_ring, sc_num_sector, sc_dist_thres);
+        RCLCPP_INFO(this->get_logger(),
+            "ScanContext: %d rings x %d sectors over %.1f m, lidar height %.2f m, "
+            "dist thresh %.2f", sc_num_ring, sc_num_sector, sc_max_radius,
+            sc_lidar_height, sc_dist_thres);
+        if (!load_prior_map(this->get_logger())) {
+            throw std::runtime_error("failed to load prior map from " + map_dir_param);
+        }
+        global_map_kdtree.reset(new pcl::KdTreeFLANN<PointType>());
+        global_map_kdtree->setInputCloud(global_map);
+        ikdtree_global.set_downsample_param(filter_size_map_min);
+        ikdtree_global.Build(global_map->points);
+        map_loaded = true;
+        RCLCPP_INFO(this->get_logger(),
+            "Prior map ready (%zu pts). Searching for initial pose: ScanContext + "
+            "ICP, %d estimates must agree within %.2f m.",
+            global_map->size(), init_agree_count, init_agree_dist);
+        // Publish the prior map once, LATCHED (transient local) so RViz shows it
+        // on connect rather than only if it happens to be listening at startup.
+        // Downsampled for display only -- the ikd-Tree keeps the full cloud.
+        {
+            rclcpp::QoS qos(1);
+            qos.transient_local().reliable();
+            pubPriorMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/prior_map", qos);
+            PointCloudXYZI::Ptr shown(new PointCloudXYZI());
+            pcl::VoxelGrid<PointType> vg;
+            vg.setLeafSize(prior_map_view_leaf, prior_map_view_leaf, prior_map_view_leaf);
+            vg.setInputCloud(global_map);
+            vg.filter(*shown);
+            sensor_msgs::msg::PointCloud2 msg;
+            pcl::toROSMsg(*shown, msg);
+            msg.header.frame_id = map_frame;
+            msg.header.stamp = this->get_clock()->now();
+            pubPriorMap_->publish(msg);
+            RCLCPP_INFO(this->get_logger(),
+                "Published /prior_map on %s (%zu pts at %.2f m leaf, latched)",
+                map_frame.c_str(), shown->size(), prior_map_view_leaf);
+        }
 
-                Eigen::Matrix4d T_odom_current = Eigen::Matrix4d::Identity();
-                T_odom_current.block<3, 3>(0, 0) = state_point.rot.toRotationMatrix();
-                T_odom_current.block<3, 1>(0, 3) = state_point.pos;
+        // /relocalize -- "I do not trust where I think I am". Re-arms the
+        // ScanContext search from scratch.
+        //
+        // The prior map STAYS in the ikd-Tree while searching. That is
+        // deliberate: the search thread does not use the ikd-Tree (it works off
+        // global_map_kdtree and the per-keyframe clouds), and swapping a local
+        // map back in would mean destroying and rebuilding a 4.5M-point tree on
+        // a service call. While lost the filter simply finds no correspondences
+        // and coasts on IMU, which is what being lost IS.
+        //
+        // Coasting does not corrupt the answer either: the new lock is applied
+        // as T_map_at_lock * T_odom_at_lock^-1 * T_odom_now, all relative, so
+        // however wrong the pose is when the fix arrives, it cancels.
+        srv_relocalize_ = this->create_service<std_srvs::srv::Trigger>(
+            "/relocalize",
+            [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                   std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+                if (!map_loaded) {
+                    res->success = false;
+                    res->message = "prior map not loaded";
+                    return;
+                }
+                {   // drop the odometry trail: it indexes scans from the OLD
+                    // search, and the new lock will index into this vector.
+                    std::lock_guard<std::mutex> lk(init_feats_mutex);
+                    std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
+                    std::swap(init_feats_down_bodys, empty);
+                    position_init.clear();
+                    pose_init.clear();
+                    init_count = 0;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(init_state_mutex);
+                    global_localization_finish = false;   // re-arm the search
+                }
+                global_update = false;                    // allow a new teleport
+                RCLCPP_WARN(this->get_logger(),
+                    "/relocalize: searching again. The pose is NOT trustworthy "
+                    "until the next 'Localized' line.");
+                res->success = true;
+                res->message = "Global search re-armed; watch the log for [init].";
+            });
 
-                Eigen::Matrix4d T_map_init_time = init_result.second;
+        init_thread_ = std::thread(global_localization_thread, this->get_logger());
 
-                Eigen::Matrix4d T_map_current = T_map_init_time * T_odom_init_time.inverse() * T_odom_current;
+        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
-                state_ikfom global_state = state_point;
-                global_state.pos = T_map_current.block<3, 1>(0, 3);
-                global_state.rot = T_map_current.block<3, 3>(0, 0);
-                kf.change_x(global_state);
-                state_point = kf.get_x();
-                ikdtree = std::move(ikdtree_global);
-                global_update = true;
-            }
-            lock_state.unlock();
+        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
+        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
-            std::chrono::steady_clock::time_point t_begin = std::chrono::steady_clock::now();
+        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+        RCLCPP_INFO(this->get_logger(), "Node init finished.");
+    }
+
+    ~LaserMappingNode()
+    {
+        {   // unblock the init thread if it is still searching
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            global_localization_finish = true;
+        }
+        if (init_thread_.joinable()) init_thread_.join();
+        fout_out.close();
+        fout_pre.close();
+        fclose(fp);
+    }
+
+private:
+    void timer_callback()
+    {
+        if(sync_packages(Measures))
+        {
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu->first_lidar_time = first_lidar_time;
                 flg_first_scan = false;
-                continue;
+                return;
             }
 
             double t0,t1,t2,t3,t4,t5,match_start, solve_start, svd_time;
@@ -1103,18 +1474,91 @@ int main(int argc, char** argv)
 
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
+
+            // THE HANDOVER. A lock has been found but not yet applied: move the
+            // filter state into map coordinates and give it the prior map to
+            // register against. From here the estimate IS the map pose -- there
+            // is no map -> odom correction, which is the whole point of this node.
+            //
+            // The lock names the scan it was computed from, and odometry has run
+            // on since, so carry it forward:
+            //   T_map_now = T_map_at_lock * T_odom_at_lock^-1 * T_odom_now
+            {
+                std::unique_lock<std::mutex> lk(init_state_mutex);
+                const bool locked = global_localization_finish;
+                lk.unlock();
+                if (locked && !global_update)
+                {
+                    const int id = init_result.first;
+                    Eigen::Matrix4d T_odom_lock = Eigen::Matrix4d::Identity();
+                    T_odom_lock.block<3,3>(0,0) = pose_init[id].toRotationMatrix();
+                    T_odom_lock.block<3,1>(0,3) = position_init[id];
+
+                    Eigen::Matrix4d T_odom_now = Eigen::Matrix4d::Identity();
+                    T_odom_now.block<3,3>(0,0) = state_point.rot.toRotationMatrix();
+                    T_odom_now.block<3,1>(0,3) = state_point.pos;
+
+                    const Eigen::Matrix4d T_map_now =
+                        init_result.second * T_odom_lock.inverse() * T_odom_now;
+
+                    // The handover is a change of WORLD FRAME, not just a pose
+                    // edit, so every world-frame quantity in the state has to
+                    // rotate with it -- not only pos/rot.
+                    //
+                    // Upstream sets pos and rot alone. That is only safe when the
+                    // map frame and the LIO start frame nearly coincide, which is
+                    // true upstream and FALSE here: this map is levelled (the
+                    // map <- pgo_init transform is ~90 deg off the LIO start
+                    // attitude). Leaving grav behind therefore leaves gravity
+                    // pointing sideways in the new frame, the IMU prediction is
+                    // then wrong by ~1 g in the horizontal plane, and the filter
+                    // diverges within a few scans. MEASURED before this fix: the
+                    // first scans matched the prior map exactly (nearest
+                    // neighbour distance 0.000), then z climbed to 96 m and every
+                    // scan reported "No Effective Points".
+                    const M3D R_old = state_point.rot.toRotationMatrix();
+                    const M3D R_new = T_map_now.block<3,3>(0,0);
+                    const M3D R_delta = R_new * R_old.transpose();
+
+                    state_ikfom gs = state_point;
+                    gs.pos  = T_map_now.block<3,1>(0,3);
+                    gs.rot  = R_new;
+                    gs.vel  = R_delta * state_point.vel;      // world-frame velocity
+                    gs.grav = S2(V3D(R_delta * state_point.grav.vec));
+                    // bg/ba are body-frame biases and offset_R/T_L_I is the
+                    // lidar-IMU extrinsic; none of those are world-frame, so they
+                    // carry over untouched.
+                    kf.change_x(gs);
+                    state_point = kf.get_x();
+
+                    // Hand the filter the prior map -- but only the FIRST time.
+                    // ikdtree_global is moved-from afterwards, and on a
+                    // /relocalize the tree already holds the prior map, so a
+                    // second swap would install an empty tree.
+                    if (!map_swapped) {
+                        ikdtree = std::move(ikdtree_global);
+                        map_swapped = true;
+                    }
+                    global_update = true;
+
+                    RCLCPP_INFO(this->get_logger(),
+                        "Localized: filter is now in the map frame at "
+                        "x=%.2f y=%.2f z=%.2f; prior map is read-only from here.",
+                        gs.pos(0), gs.pos(1), gs.pos(2));
+                }
+            }
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
-                ROS_WARN("No point, skip this scan!\n");
-                continue;
+                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                return;
             }
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
             /*** Segment the map in lidar FOV ***/
-//            lasermap_fov_segment();
+            lasermap_fov_segment();
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1124,9 +1568,9 @@ int main(int argc, char** argv)
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
+                RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
                 {
-
                     ikdtree.set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
                     for(int i = 0; i < feats_down_size; i++)
@@ -1135,7 +1579,7 @@ int main(int argc, char** argv)
                     }
                     ikdtree.Build(feats_down_world->points);
                 }
-                continue;
+                return;
             }
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
@@ -1145,8 +1589,8 @@ int main(int argc, char** argv)
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
-                ROS_WARN("No point, skip this scan!\n");
-                continue;
+                RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
+                return;
             }
             
             normvec->resize(feats_down_size);
@@ -1185,48 +1629,48 @@ int main(int argc, char** argv)
 
             double t_update_end = omp_get_wtime();
 
-
-
-
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped);
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            if (!global_localization_finish)
-            {
-                std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
+            // Only while still searching. After the lock the prior map is
+            // READ-ONLY: adding live scans would let drift contaminate the very
+            // thing being localized against.
+            if (!global_update) {
                 map_incremental();
-                lock_init_feats.unlock();
             }
             t5 = omp_get_wtime();
-
+            
             /******* Publish points *******/
-            if (path_en && global_localization_finish)                         publish_path(pubPath);
-            if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
-            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
-            // publish_effect_world(pubLaserCloudEffect);
-            // publish_map(pubLaserCloudMap);
-
-
-            // for init
+            // Feed the init thread while still searching: the undistorted,
+            // downsampled scan for ScanContext, and the odometry pose it was
+            // taken at, so a lock found several scans later can be carried
+            // forward to now. Indices into position_init/pose_init ARE the id
+            // queued alongside the cloud, so the two cannot drift apart.
             if (!global_localization_finish)
             {
                 position_init.push_back(state_point.pos);
                 pose_init.push_back(state_point.rot);
-                std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
-                init_feats_down_bodys.push(std::make_pair(init_count, feats_down_body));
-                lock_init_feats.unlock();
+                PointCloudXYZI::Ptr snapshot(new PointCloudXYZI());
+                pcl::copyPointCloud(*feats_down_body, *snapshot);
+                {
+                    std::lock_guard<std::mutex> lk(init_feats_mutex);
+                    // Bounded: ScanContext + two ICP passes is slower than the
+                    // scan rate, so an unbounded queue would grow without limit
+                    // and the thread would work on ever-staler scans.
+                    if (init_feats_down_bodys.size() < 5)
+                        init_feats_down_bodys.push({init_count, snapshot});
+                }
                 init_count++;
             }
 
-            static double total_time = 0;
-            static int time_count = 1;
-            std::chrono::steady_clock::time_point t_end = std::chrono::steady_clock::now();
-            double time_cost = std::chrono::duration_cast<std::chrono::duration<double> >(t_end - t_begin).count();
-            total_time += time_cost;
-//            cout << "time cost = " << time_cost * 1000.0  << " ms"<< endl;
-            time_count++;
+            if (path_en)                         publish_path(pubPath_);
+            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
+            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
+            if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
+            // if (map_pub_en) publish_map(pubLaserCloudMap_);
+
             /*** Debug variables ***/
             if (runtime_pos_log)
             {
@@ -1257,11 +1701,70 @@ int main(int argc, char** argv)
                 dump_lio_state_to_log(fp);
             }
         }
-
-        status = ros::ok();
-        rate.sleep();
     }
 
+    void map_publish_callback()
+    {
+        if (map_pub_en) publish_map(pubLaserCloudMap_);
+    }
+
+    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    {
+        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
+        if (pcd_save_en)
+        {
+            save_to_pcd();
+            res->success = true;
+            res->message = "Map saved.";
+        }
+        else
+        {
+            res->success = false;
+            res->message = "Map save disabled.";
+        }
+    }
+
+private:
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
+#ifdef HAVE_LIVOX
+    rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+#endif
+
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::thread init_thread_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubPriorMap_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_relocalize_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::TimerBase::SharedPtr map_pub_timer_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+
+    bool effect_pub_en = false, map_pub_en = false;
+    int effect_feat_num = 0, frame_num = 0;
+    double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
+    bool flg_EKF_converged, EKF_stop_flg = 0;
+    double epsi[23] = {0.001};
+
+    FILE *fp;
+    ofstream fout_pre, fout_out, fout_dbg;
+};
+
+int main(int argc, char** argv)
+{
+    rclcpp::init(argc, argv);
+
+    signal(SIGINT, SigHandle);
+
+    rclcpp::spin(std::make_shared<LaserMappingNode>());
+
+    if (rclcpp::ok())
+        rclcpp::shutdown();
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/
@@ -1273,9 +1776,6 @@ int main(int argc, char** argv)
         cout << "current scan saved to /PCD/" << file_name<<endl;
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
     }
-
-    fout_out.close();
-    fout_pre.close();
 
     if (runtime_pos_log)
     {

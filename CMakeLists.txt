@@ -124,8 +124,35 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+# ---------------- FAST-LOCALIZATION ---------------- #
+# Localization against a prior map: the same estimator, but the prior map IS the
+# ikd-Tree it registers against, so the map constraint is inside the filter
+# rather than a discrete map->odom correction bolted on outside. Built beside
+# fastlio_mapping, not instead of it -- mapping still needs the plain node.
+add_executable(fastlio_localization
+  src/laserLocalization.cpp
+  include/ikd-Tree/ikd_Tree.cpp
+  src/preprocess.cpp
+  include/Scancontext/Scancontext.cpp)
+target_include_directories(fastlio_localization PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(fastlio_localization ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
+target_include_directories(fastlio_localization PRIVATE ${PYTHON_INCLUDE_DIRS})
+
+if($ENV{ROS_DISTRO} IN_LIST EOL_LIST)
+  rosidl_target_interfaces(fastlio_localization
+    ${PROJECT_NAME} "rosidl_typesupport_cpp")
+else()
+  target_link_libraries(fastlio_localization ${cpp_typesupport_target})
+endif()
+
+ament_target_dependencies(fastlio_localization ${dependencies})
+
 # ---------------- Install --------------- #
-install(TARGETS fastlio_mapping
+install(TARGETS fastlio_mapping fastlio_localization
   DESTINATION lib/${PROJECT_NAME}
 )
 

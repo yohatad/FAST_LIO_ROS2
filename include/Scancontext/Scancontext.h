@@ -12,15 +12,18 @@
 
 #include <Eigen/Dense>
 
-#include <opencv2/opencv.hpp>
-#include <opencv2/core/eigen.hpp>
-#include <opencv2/highgui/highgui.hpp>
-#include <cv_bridge/cv_bridge.h>
+// OpenCV headers removed on import into this workspace: upstream includes
+// opencv2/opencv.hpp, core/eigen.hpp and highgui, but nothing in Scancontext.cpp
+// or this header uses a single cv:: symbol -- they are vestigial. Keeping them
+// would make OpenCV a hard build dependency of fast_lio for no functionality.
+// cv_bridge and pcl_conversions went the same way: both are ROS-message glue,
+// and this module never touches a ROS message -- it takes a pcl::PointCloud and
+// returns an Eigen matrix. Dropping them is what makes it portable to ROS 2
+// unchanged.
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl_conversions/pcl_conversions.h>
 
 #include "nanoflann.hpp"
 #include "KDTreeVectorOfVectorsAdaptor.h"
@@ -73,24 +76,45 @@ public:
     std::pair<int, float> detectLoopClosureID( void ); // int: nearest node index, float: relative yaw
     void dropBackScancontextAndKeys();
 
+    // Set the descriptor geometry to the sensor actually in use. Must be called
+    // before any descriptor is built -- the map DB and the live scans have to be
+    // described identically or they are not comparable.
+    void set_geometry(double lidar_height, double max_radius,
+                      int num_ring, int num_sector, double dist_thres)
+    {
+        LIDAR_HEIGHT = lidar_height;
+        PC_MAX_RADIUS = max_radius;
+        PC_NUM_RING = num_ring;
+        PC_NUM_SECTOR = num_sector;
+        SC_DIST_THRES = dist_thres;
+        PC_UNIT_SECTORANGLE = 360.0 / double(PC_NUM_SECTOR);
+        PC_UNIT_RINGGAP = PC_MAX_RADIUS / double(PC_NUM_RING);
+    }
+
 
 public:
     // hyper parameters ()
-    const double LIDAR_HEIGHT = 2.0; // lidar height : add this for simply directly using lidar scan in the lidar local coord (not robot base coord) / if you use robot-coord-transformed lidar scans, just set this as 0.
+    // Made runtime-settable on import (see set_geometry below). Upstream's
+    // constants describe a car-mounted 64-beam spinning lidar; this rig is a
+    // short-range L2 whose downsampled keyframes hold ~1600 points with 90% of
+    // them inside 2.9 m. At PC_MAX_RADIUS 80 only 3 of 20 rings ever receive a
+    // point, so 85% of the descriptor is structurally empty and matching is
+    // decided by almost nothing. MEASURED over 40 keyframes spanning the run.
+    double LIDAR_HEIGHT = 2.0; // added to z so heights are ground-referenced and positive
 
-    const int    PC_NUM_RING = 20; // 20 in the original paper (IROS 18)
-    const int    PC_NUM_SECTOR = 60; // 60 in the original paper (IROS 18)
-    const double PC_MAX_RADIUS = 80.0; // 80 meter max in the original paper (IROS 18)
-    const double PC_UNIT_SECTORANGLE = 360.0 / double(PC_NUM_SECTOR);
-    const double PC_UNIT_RINGGAP = PC_MAX_RADIUS / double(PC_NUM_RING);
+    int    PC_NUM_RING = 20; // 20 in the original paper (IROS 18)
+    int    PC_NUM_SECTOR = 60; // 60 in the original paper (IROS 18)
+    double PC_MAX_RADIUS = 80.0; // 80 meter max in the original paper (IROS 18)
+    double PC_UNIT_SECTORANGLE = 360.0 / double(PC_NUM_SECTOR);
+    double PC_UNIT_RINGGAP = PC_MAX_RADIUS / double(PC_NUM_RING);
 
     // tree
     const int    NUM_EXCLUDE_RECENT = 50; // simply just keyframe gap, but node position distance-based exclusion is ok. 
-    const int    NUM_CANDIDATES_FROM_TREE = 10; // 10 is enough. (refer the IROS 18 paper)
+    int    NUM_CANDIDATES_FROM_TREE = 10; // 10 is enough. (refer the IROS 18 paper)
 
     // loop thres
     const double SEARCH_RATIO = 0.1; // for fast comparison, no Brute-force, but search 10 % is okay. // not was in the original conf paper, but improved ver.
-    const double SC_DIST_THRES = 0.13; // empirically 0.1-0.2 is fine (rare false-alarms) for 20x60 polar context (but for 0.15 <, DCS or ICP fit score check (e.g., in LeGO-LOAM) should be required for robustness)
+    double SC_DIST_THRES = 0.13; // empirically 0.1-0.2 is fine (rare false-alarms) for 20x60 polar context (but for 0.15 <, DCS or ICP fit score check (e.g., in LeGO-LOAM) should be required for robustness)
     // const double SC_DIST_THRES = 0.5; // 0.4-0.6 is good choice for using with robust kernel (e.g., Cauchy, DCS) + icp fitness threshold / if not, recommend 0.1-0.15
 
     // config 
