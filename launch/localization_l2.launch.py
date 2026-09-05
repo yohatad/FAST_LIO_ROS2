@@ -30,9 +30,38 @@ def generate_launch_description():
     share = get_package_share_directory('fast_lio')
 
     args = [
-        DeclareLaunchArgument('map_dir', default_value='',
-            description='REQUIRED. Directory holding pose.json and pcd/, from '
-                        'utils/pgo_to_scancontext_map.py.'),
+        # Split deliberately. pose.json IS the map's identity (233 KB) and ships
+        # tracked in pepper_navigation beside pepper_map_lc_poses.txt, so the two
+        # localization stacks' maps are visibly one set. The 2735 keyframe clouds
+        # are 75 MB of gitignored binary and live outside any package.
+        DeclareLaunchArgument('map_dir',
+            default_value=os.path.join(
+                get_package_share_directory('pepper_navigation'), 'pcd'),
+            description='Directory holding the pose file.'),
+        DeclareLaunchArgument('map_pose_file', default_value='sc_pose_20260823.json',
+            description='Pose file within map_dir (or an absolute path). Named '
+                        'per run: this directory also holds the OTHER stack\'s '
+                        'pepper_map_lc_poses.txt, and a second map would drop a '
+                        'second pose file beside it.'),
+        # In pepper_navigation/pcd alongside pose.json, pepper_map_lc.pcd and
+        # pepper_map_lc_poses.txt: every artifact of one mapping run in one
+        # place, package-relative so it resolves on any machine rather than via
+        # an absolute /home/<user> path. The clouds are gitignored (75 MB) like
+        # pepper_map_lc.pcd is, and copied to a new machine the same way.
+        #
+        # In a subfolder named after the RUN, not a bare pcd/: pose.json indexes
+        # these by number, so two undifferentiated folders would be silently
+        # interchangeable -- the same class of bug as a .pcd paired with the
+        # wrong poses, which cost a day to find.
+        #
+        # Installing 2735 files sounds expensive and is not: CMake copies only
+        # what changed, so a rebuild after the first is ~0.5 s.
+        DeclareLaunchArgument('map_scan_dir',
+            default_value=os.path.join(
+                get_package_share_directory('pepper_navigation'),
+                'pcd', 'sc_pcd_20260823'),
+            description='Directory holding the per-keyframe <N>.pcd clouds. '
+                        'Both are written by utils/pgo_to_scancontext_map.py.'),
         DeclareLaunchArgument('config_file', default_value='l2_rsimu.yaml',
             description='FAST-LIO config. Must be the SAME one the map was '
                         'built with -- the lidar/IMU extrinsic enters the '
@@ -103,6 +132,8 @@ def generate_launch_description():
                  LaunchConfiguration('publish_tf'), value_type=bool),
              'publish.tf_child_frame': LaunchConfiguration('tf_child_frame'),
              'localization.map_dir': LaunchConfiguration('map_dir'),
+             'localization.map_scan_dir': LaunchConfiguration('map_scan_dir'),
+             'localization.map_pose_file': LaunchConfiguration('map_pose_file'),
              'localization.sc_max_radius': LaunchConfiguration('sc_max_radius'),
              'localization.sc_num_ring': LaunchConfiguration('sc_num_ring'),
              'localization.sc_num_sector': LaunchConfiguration('sc_num_sector'),

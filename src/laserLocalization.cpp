@@ -162,7 +162,15 @@ bool  map_swapped   = false;               // ikdtree already holds the prior ma
 std::atomic<bool> relocalize_requested{false};
 int   init_count = 0;
 std::pair<int, Eigen::Matrix4d> init_result;
-std::string map_dir_param;                 // <map_dir> holding pose.json and pcd/
+// The map is TWO things with very different natures, so they are addressed
+// separately. pose.json is 233 KB and IS the map's identity -- it belongs in
+// pepper_navigation beside pepper_map_lc_poses.txt, tracked, where the pairing
+// between the two localization stacks' maps is visible. The 2735 keyframe
+// clouds are 75 MB of binary that would be gitignored anyway, and putting them
+// in a ROS package means install(DIRECTORY) copies all 2735 on every build.
+std::string map_dir_param;                 // holds the pose file
+std::string map_pose_file_param;           // pose file; bare name or absolute path
+std::string map_scan_dir_param;            // holds <N>.pcd; defaults to <map_dir>/pcd
 int    init_agree_count = 2;               // independent locks that must agree
 double init_agree_dist  = 2.0;             // metres they must agree within
 double init_icp_coarse  = 5.0, init_icp_fine = 1.0;
@@ -957,7 +965,14 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
  *** that pose), and transformed into map only when accumulating global_map. ***/
 bool load_prior_map(const rclcpp::Logger &log)
 {
-    const std::string pose_path = map_dir_param + "/pose.json";
+    // Named per run, not a bare pose.json: this directory also holds
+    // pepper_map_lc_poses.txt for the other stack, and a second map would drop
+    // a second pose file beside it. An undated name makes those silently
+    // interchangeable -- the same failure as a .pcd paired with the wrong poses.
+    const std::string pose_path =
+        map_pose_file_param.find('/') != std::string::npos
+            ? map_pose_file_param
+            : map_dir_param + "/" + map_pose_file_param;
     std::ifstream pose_file(pose_path);
     if (!pose_file.is_open()) {
         RCLCPP_ERROR(log, "cannot open %s", pose_path.c_str());
@@ -970,7 +985,7 @@ bool load_prior_map(const rclcpp::Logger &log)
         Eigen::Quaterniond q(w, x, y, z);
         q.normalize();
         V3D pos(tx, ty, tz);
-        const std::string pcd = map_dir_param + "/pcd/" + std::to_string(count) + ".pcd";
+        const std::string pcd = map_scan_dir_param + "/" + std::to_string(count) + ".pcd";
         PointCloudXYZI::Ptr temp(new PointCloudXYZI());
         if (pcl::io::loadPCDFile(pcd, *temp) < 0) {
             RCLCPP_ERROR(log, "cannot read %s (pose.json has %d entries so far)",
@@ -1081,7 +1096,7 @@ void global_localization_thread(rclcpp::Logger log)
             pcl::transformPointCloud(*scan, *scan, T_sc);
 
             PointCloudXYZI::Ptr kf_cloud(new PointCloudXYZI());
-            const std::string kf_pcd = map_dir_param + "/pcd/" + std::to_string(match_id) + ".pcd";
+            const std::string kf_pcd = map_scan_dir_param + "/" + std::to_string(match_id) + ".pcd";
             if (pcl::io::loadPCDFile(kf_pcd, *kf_cloud) < 0) { continue; }
 
             // Coarse then fine: the coarse pass has to survive a ScanContext hit
@@ -1250,11 +1265,17 @@ public:
         this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
         // FAST-LOCALIZATION parameters
         this->declare_parameter<std::string>("localization.map_dir", "");
+        this->declare_parameter<std::string>("localization.map_scan_dir", "");
+        this->declare_parameter<std::string>("localization.map_pose_file", "pose.json");
         this->declare_parameter<int>("localization.init_agree_count", 2);
         this->declare_parameter<double>("localization.init_agree_dist", 2.0);
         this->declare_parameter<double>("localization.init_icp_coarse", 5.0);
         this->declare_parameter<double>("localization.init_icp_fine", 1.0);
         this->get_parameter("localization.map_dir", map_dir_param);
+        this->get_parameter("localization.map_scan_dir", map_scan_dir_param);
+        this->get_parameter("localization.map_pose_file", map_pose_file_param);
+        if (map_pose_file_param.empty()) map_pose_file_param = "pose.json";
+        if (map_scan_dir_param.empty()) map_scan_dir_param = map_dir_param + "/pcd";
         this->get_parameter("localization.init_agree_count", init_agree_count);
         this->get_parameter("localization.init_agree_dist", init_agree_dist);
         this->get_parameter("localization.init_icp_coarse", init_icp_coarse);
@@ -1413,6 +1434,9 @@ public:
             "ScanContext: %d rings x %d sectors over %.1f m, lidar height %.2f m, "
             "dist thresh %.2f", sc_num_ring, sc_num_sector, sc_max_radius,
             sc_lidar_height, sc_dist_thres);
+        RCLCPP_INFO(this->get_logger(), "Map: poses %s/%s  scans %s/",
+                    map_dir_param.c_str(), map_pose_file_param.c_str(),
+                    map_scan_dir_param.c_str());
         if (!load_prior_map(this->get_logger())) {
             throw std::runtime_error("failed to load prior map from " + map_dir_param);
         }
