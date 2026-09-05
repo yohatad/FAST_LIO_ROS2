@@ -36,6 +36,7 @@
 #include <mutex>
 #include <atomic>
 #include <std_srvs/srv/trigger.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -160,6 +161,17 @@ bool  global_localization_finish = false;  // a lock has been found
 bool  global_update = false;               // the current lock has been APPLIED
 bool  map_swapped   = false;               // ikdtree already holds the prior map
 std::atomic<bool> relocalize_requested{false};
+// A pose handed in on /initialpose, waiting to be applied by the scan pipeline.
+// Kept separate from init_result because it is applied DIFFERENTLY: a
+// ScanContext lock names a past scan and must be carried forward by the odometry
+// since, whereas a seed means "you are here, NOW" and is applied as-is. Feeding
+// a seed through the carry-forward is wrong once a lock already exists, because
+// the state is then in map while the odometry trail is in the LIO frame --
+// MEASURED, that sent a correctly-localized filter from x=13.09 to x=64.34
+// z=49.80.
+std::mutex seed_mutex;
+Eigen::Matrix4d pending_seed = Eigen::Matrix4d::Identity();
+std::atomic<bool> has_pending_seed{false};
 int   init_count = 0;
 std::pair<int, Eigen::Matrix4d> init_result;
 // The map is TWO things with very different natures, so they are addressed
@@ -201,7 +213,12 @@ double sc_lidar_height = 0.5, sc_max_radius = 10.0, sc_dist_thres = 0.15;
 // which is a much harder thing to be accidentally right about. The cost is that
 // initialization cannot finish while stationary -- arguably correct, since one
 // viewpoint genuinely cannot disambiguate a corridor.
-bool   init_require_motion = true;
+// Default OFF. It makes an unseeded ScanContext lock far more reliable (see
+// above), but it also means initialization cannot finish until the robot has
+// driven init_motion_min, which is the wrong trade when an operator is going to
+// supply the pose via /initialpose anyway -- a seeded start needs no
+// disambiguation. Turn it ON for unattended startup with no seed.
+bool   init_require_motion = false;
 double init_motion_min = 0.50;    // metres of odometry between the two scans
 double init_min_overlap = 0.70;
 double init_overlap_dist = 0.20;  // metres; a point nearer than this is "on the map"
@@ -1537,6 +1554,63 @@ public:
                 res->message = "Global search re-armed; watch the log for [init].";
             });
 
+        // /initialpose -- seeded initialization, as an alternative to the
+        // ScanContext search rather than a replacement for it. The search keeps
+        // running until something locks; whichever arrives first wins.
+        //
+        // The pose is map <- base_footprint (that is what RViz's 2D Pose
+        // Estimate publishes), while the filter state is map <- body, so the
+        // static body->base extrinsic is composed out. It is applied through the
+        // SAME path as a ScanContext lock -- init_result plus the teleport in
+        // the scan pipeline -- so gravity and velocity are rotated correctly and
+        // the prior map is swapped in exactly once.
+        sub_initialpose_ = this->create_subscription<
+            geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "/initialpose", 1,
+            [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+                if (!map_loaded) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "/initialpose ignored: prior map not loaded yet");
+                    return;
+                }
+                if (!tf_child_resolved) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "/initialpose ignored: %s -> %s extrinsic not resolved yet, "
+                        "so the pose cannot be converted to the filter's body frame",
+                        body_frame.c_str(), tf_child_frame.c_str());
+                    return;
+                }
+                const auto &q = msg->pose.pose.orientation;
+                const auto &t = msg->pose.pose.position;
+                Eigen::Quaterniond eq(q.w, q.x, q.y, q.z);
+                eq.normalize();
+                Eigen::Matrix4d T_map_base = Eigen::Matrix4d::Identity();
+                T_map_base.block<3,3>(0,0) = eq.toRotationMatrix();
+                T_map_base.block<3,1>(0,3) = V3D(t.x, t.y, t.z);
+
+                Eigen::Matrix4d T_body_base = Eigen::Matrix4d::Identity();
+                T_body_base.block<3,3>(0,0) = R_body_to_tfchild;
+                T_body_base.block<3,1>(0,3) = t_body_to_tfchild;
+
+                const Eigen::Matrix4d T_map_body = T_map_base * T_body_base.inverse();
+
+                {
+                    std::lock_guard<std::mutex> lk(seed_mutex);
+                    pending_seed = T_map_body;
+                }
+                has_pending_seed = true;
+                {
+                    std::lock_guard<std::mutex> lk(init_state_mutex);
+                    global_localization_finish = true; // stand the search down
+                }
+                RCLCPP_INFO(this->get_logger(),
+                    "/initialpose accepted: seeding at x=%.2f y=%.2f yaw=%.1f deg "
+                    "(map -> %s)", t.x, t.y,
+                    std::atan2(2.0*(eq.w()*eq.z()+eq.x()*eq.y()),
+                               1.0-2.0*(eq.y()*eq.y()+eq.z()*eq.z()))*180.0/M_PI,
+                    tf_child_frame.c_str());
+            });
+
         init_thread_ = std::thread(global_localization_thread, this->get_logger());
 
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
@@ -1594,6 +1668,35 @@ private:
             // The lock names the scan it was computed from, and odometry has run
             // on since, so carry it forward:
             //   T_map_now = T_map_at_lock * T_odom_at_lock^-1 * T_odom_now
+            // A seed takes precedence and is applied directly: no odometry
+            // carry-forward, so it is correct whether or not a lock exists.
+            if (has_pending_seed.exchange(false))
+            {
+                Eigen::Matrix4d T_map_now;
+                {
+                    std::lock_guard<std::mutex> lk(seed_mutex);
+                    T_map_now = pending_seed;
+                }
+                const M3D R_old = state_point.rot.toRotationMatrix();
+                const M3D R_new = T_map_now.block<3,3>(0,0);
+                const M3D R_delta = R_new * R_old.transpose();
+                state_ikfom gs = state_point;
+                gs.pos  = T_map_now.block<3,1>(0,3);
+                gs.rot  = R_new;
+                gs.vel  = R_delta * state_point.vel;
+                gs.grav = S2(V3D(R_delta * state_point.grav.vec));
+                kf.change_x(gs);
+                state_point = kf.get_x();
+                if (!map_swapped) {
+                    ikdtree = std::move(ikdtree_global);
+                    map_swapped = true;
+                }
+                global_update = true;
+                RCLCPP_INFO(this->get_logger(),
+                    "Seeded from /initialpose: filter is now at x=%.2f y=%.2f z=%.2f",
+                    gs.pos(0), gs.pos(1), gs.pos(2));
+            }
+
             {
                 std::unique_lock<std::mutex> lk(init_state_mutex);
                 const bool locked = global_localization_finish;
@@ -1856,6 +1959,8 @@ private:
     std::thread init_thread_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubPriorMap_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_relocalize_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+        sub_initialpose_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;

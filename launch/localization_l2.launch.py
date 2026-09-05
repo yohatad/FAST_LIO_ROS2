@@ -102,12 +102,15 @@ def generate_launch_description():
         # wrong place agree perfectly. MEASURED starting mid-corridor, it locked
         # 41 m from truth on two mutually-consistent matches. These ask the map
         # instead -- what fraction of the scan lands on it at the proposed pose.
-        # Agreement between two estimates taken from a STANDSTILL is close to
-        # vacuous -- the scans are near-identical, so of course they agree.
-        # Requiring travel between them makes a spurious match prove itself
-        # across motion. Set false to accept a lock without moving (upstream
-        # behaviour), at the cost of the failure this was added to stop.
-        DeclareLaunchArgument('init_require_motion', default_value='true'),
+        # OFF by default. Agreement between two estimates taken from a
+        # STANDSTILL is close to vacuous -- the scans are near-identical, so of
+        # course they agree -- and with it off, an unseeded start in a
+        # self-similar place CAN lock wrongly (MEASURED: 41 m out, on two
+        # mutually-consistent matches). Turn it ON for unattended startup with
+        # no seed. It is off by default because a seeded start via /initialpose
+        # needs no disambiguation, and requiring the robot to drive 0.5 m before
+        # nav2 can come up is the wrong trade when an operator is present.
+        DeclareLaunchArgument('init_require_motion', default_value='false'),
         DeclareLaunchArgument('init_motion_min', default_value='0.50',
             description='Metres of odometry required between the agreeing '
                         'estimates. Only used when init_require_motion.'),
