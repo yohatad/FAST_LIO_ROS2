@@ -220,6 +220,14 @@ bool  tf_child_resolved = false;
 M3D   R_body_to_tfchild(Eye3d);
 V3D   t_body_to_tfchild(0, 0, 0);
 std::shared_ptr<tf2_ros::Buffer> tf_buffer_g;
+rclcpp::Node *node_g = nullptr;            // for logging from the free functions
+static rclcpp::Logger this_logger() {
+    return node_g ? node_g->get_logger() : rclcpp::get_logger("fast_lio_localization");
+}
+static rclcpp::Clock::SharedPtr this_clock() {
+    static auto fallback = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
+    return node_g ? node_g->get_clock() : fallback;
+}
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_g;
 bool   map_loaded = false;
 
@@ -789,8 +797,16 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
                     R_body_to_tfchild = eq.toRotationMatrix();
                     t_body_to_tfchild = V3D(v.x, v.y, v.z);
                     tf_child_resolved = true;
-                } catch (const tf2::TransformException &) {
-                    return;      // extrinsic not up yet; try again next scan
+                } catch (const tf2::TransformException &ex) {
+                    // Throttled, not silent: this used to return quietly and the
+                    // only visible effect was nav2 waiting forever for a map
+                    // frame that was never going to arrive.
+                    RCLCPP_WARN_THROTTLE(this_logger(), *this_clock(), 5000,
+                        "cannot resolve %s -> %s yet (%s); NOT broadcasting "
+                        "%s -> %s until it does",
+                        body_frame.c_str(), tf_child_frame.c_str(), ex.what(),
+                        map_frame.c_str(), tf_child_frame.c_str());
+                    return;
                 }
             }
             const Eigen::Quaterniond q_mb(odomAftMapped.pose.pose.orientation.w,
@@ -1302,8 +1318,15 @@ public:
         this->get_parameter("localization.prior_map_view_leaf", prior_map_view_leaf);
         this->declare_parameter<std::string>("publish.tf_child_frame", "base_footprint");
         this->get_parameter("publish.tf_child_frame", tf_child_frame);
+        node_g = this;
         tf_buffer_g = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-        tf_listener_g = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_g, this);
+        // spin_thread=true: the listener gets its OWN thread. Sharing this
+        // node's single-threaded executor does not work -- the scan timer
+        // callback runs the whole iEKF update and blocks it, so /tf_static
+        // callbacks starve and the buffer stays empty however long you wait.
+        // Symptom was a lookup that never resolved, silently, while the frames
+        // were being published the whole time.
+        tf_listener_g = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_g, this, true);
         this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
         this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
         this->get_parameter_or<double>("mapping.fov_degree",fov_deg,180.f);
