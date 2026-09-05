@@ -238,6 +238,7 @@ M3D   R_body_to_tfchild(Eye3d);
 V3D   t_body_to_tfchild(0, 0, 0);
 std::shared_ptr<tf2_ros::Buffer> tf_buffer_g;
 rclcpp::Node *node_g = nullptr;            // for logging from the free functions
+rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_localization_g;
 static rclcpp::Logger this_logger() {
     return node_g ? node_g->get_logger() : rclcpp::get_logger("fast_lio_localization");
 }
@@ -853,6 +854,48 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
             trans.transform.rotation = odomAftMapped.pose.pose.orientation;
         }
         tf_br->sendTransform(trans);
+
+        // /localization/pose -- the SAME pose and twist, but genuinely in
+        // tf_child_frame (base_footprint), matching the TF edge just sent.
+        //
+        // /Odometry keeps stock FAST-LIO semantics: child_frame_id is body_frame,
+        // the IMU on the mast, and the twist is in those axes. Anything that
+        // assumes child_frame_id is the robot base -- nav2's odom_topic, for
+        // one -- then reads a velocity rotated by the mount, ~64 deg of yaw on
+        // this rig. lio_localization's transform_fusion documents and fixes the
+        // same thing; this mirrors it so both stacks publish the same contract.
+        if (pub_localization_g && tf_child_resolved) {
+            nav_msgs::msg::Odometry loc;
+            loc.header = odomAftMapped.header;
+            loc.child_frame_id = tf_child_frame;
+            loc.pose.pose.position.x = trans.transform.translation.x;
+            loc.pose.pose.position.y = trans.transform.translation.y;
+            loc.pose.pose.position.z = trans.transform.translation.z;
+            loc.pose.pose.orientation = trans.transform.rotation;
+            loc.pose.covariance = odomAftMapped.pose.covariance;
+
+            // Twist is expressed in child_frame_id, so rotating alone is not
+            // enough -- the base origin sits off the body origin, so it also
+            // picks up the lever-arm term:
+            //   w_base = R * w_body
+            //   v_base = R * v_body + w_base x (R * t)
+            // with R = R_base<-body and t = base origin in body coords.
+            const M3D R_bb = R_body_to_tfchild.transpose();
+            const V3D r_b  = R_bb * t_body_to_tfchild;
+            const auto &tw = odomAftMapped.twist.twist;
+            const V3D v_b_in(tw.linear.x, tw.linear.y, tw.linear.z);
+            const V3D w_b_in(tw.angular.x, tw.angular.y, tw.angular.z);
+            const V3D w_o = R_bb * w_b_in;
+            const V3D v_o = R_bb * v_b_in + w_o.cross(r_b);
+            loc.twist.twist.linear.x = v_o(0);
+            loc.twist.twist.linear.y = v_o(1);
+            loc.twist.twist.linear.z = v_o(2);
+            loc.twist.twist.angular.x = w_o(0);
+            loc.twist.twist.angular.y = w_o(1);
+            loc.twist.twist.angular.z = w_o(2);
+            loc.twist.covariance = odomAftMapped.twist.covariance;
+            pub_localization_g->publish(loc);
+        }
     }
 }
 
@@ -1336,6 +1379,8 @@ public:
         this->declare_parameter<std::string>("publish.tf_child_frame", "base_footprint");
         this->get_parameter("publish.tf_child_frame", tf_child_frame);
         node_g = this;
+        pub_localization_g =
+            this->create_publisher<nav_msgs::msg::Odometry>("/localization/pose", 10);
         tf_buffer_g = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         // spin_thread=true: the listener gets its OWN thread. Sharing this
         // node's single-threaded executor does not work -- the scan timer
