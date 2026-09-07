@@ -50,6 +50,8 @@ find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 # ROS dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+find_package(lifecycle_msgs REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -151,7 +153,10 @@ else()
   target_link_libraries(fastlio_localization ${cpp_typesupport_target})
 endif()
 
-ament_target_dependencies(fastlio_localization ${dependencies})
+ament_target_dependencies(fastlio_localization ${dependencies}
+  rclcpp_lifecycle
+  lifecycle_msgs
+)
 
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping fastlio_localization

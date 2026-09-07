@@ -69,6 +69,8 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <lifecycle_msgs/msg/state.hpp>
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
@@ -189,6 +191,12 @@ std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> candidat
 std::mutex candidate_mutex;
 bool  global_localization_finish = false;  // a lock has been found
 bool  global_update = false;               // the current lock has been APPLIED
+// Cleared by on_deactivate() to stop global_localization_thread cleanly on a
+// lifecycle deactivate, distinct from global_localization_finish (which means
+// "found a lock", not "stop running"). Guarded by init_state_mutex, same as
+// global_localization_finish, since both are read together at the top of the
+// thread's outer loop.
+bool  keep_searching = true;
 bool  map_swapped   = false;               // ikdtree already holds the prior map
 std::atomic<bool> relocalize_requested{false};
 // A pose handed in on /initialpose, waiting to be applied by the scan pipeline.
@@ -267,8 +275,8 @@ bool  tf_child_resolved = false;
 M3D   R_body_to_tfchild(Eye3d);
 V3D   t_body_to_tfchild(0, 0, 0);
 std::shared_ptr<tf2_ros::Buffer> tf_buffer_g;
-rclcpp::Node *node_g = nullptr;            // for logging from the free functions
-rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_localization_g;
+rclcpp_lifecycle::LifecycleNode *node_g = nullptr;   // for logging from the free functions
+rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_localization_g;
 static rclcpp::Logger this_logger() {
     return node_g ? node_g->get_logger() : rclcpp::get_logger("fast_lio_localization");
 }
@@ -638,7 +646,7 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
+void publish_frame_world(rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
     if(scan_pub_en)
     {
@@ -695,7 +703,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     */
 }
 
-void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
+void publish_frame_body(rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
 {
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
@@ -714,7 +722,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     publish_count -= PUBFRAME_PERIOD;
 }
 
-void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
+void publish_effect_world(rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(effct_feat_num, 1));
@@ -730,7 +738,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
+void publish_map(rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
@@ -777,7 +785,7 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     odomAftMapped.header.frame_id = map_frame;
     odomAftMapped.child_frame_id = body_frame;
@@ -929,7 +937,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
 }
 
-void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
+void publish_path(rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
@@ -1162,11 +1170,15 @@ void global_localization_thread(rclcpp::Logger log)
     rclcpp::Rate rate(20);
     while (rclcpp::ok())
     {
-        bool already_locked;
+        bool already_locked, keep_going;
         {
             std::lock_guard<std::mutex> lk(init_state_mutex);
             already_locked = global_localization_finish;
+            keep_going = keep_searching;
         }
+        // on_deactivate() sets this false and joins us -- exit promptly rather
+        // than idle-sleeping through a lifecycle transition that's waiting on us.
+        if (!keep_going) return;
         // Idle, not finished: /relocalize clears this flag to re-arm the search,
         // so returning here would make relocalization impossible for the life
         // of the process.
@@ -1351,10 +1363,30 @@ void global_localization_thread(rclcpp::Logger log)
     }
 }
 
-class LaserMappingNode : public rclcpp::Node
+class LaserMappingNode : public rclcpp_lifecycle::LifecycleNode
 {
 public:
-    LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("fast_lio_localization", options)
+    using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
+
+    LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
+        : rclcpp_lifecycle::LifecycleNode("fast_lio_localization", options)
+    {
+        // Heavy setup happens in on_configure(); resource activation (starting
+        // the scan timer, the init thread, and the lifecycle publishers) in
+        // on_activate(). See the on_cleanup() note below for this node's one
+        // real deviation from the standard lifecycle contract.
+    }
+
+    // Supports the standard configure -> activate <-> deactivate cycle
+    // (pause/resume): while inactive, the scan timer does not exist, so no
+    // scan is processed and no publisher emits anything (a LifecyclePublisher
+    // silently no-ops until activated).
+    //
+    // on_cleanup() is DELIBERATELY NOT SUPPORTED (see below): the prior map,
+    // ikd-Trees, and filter state are process-global, not member state, so
+    // there is no safe way to release and reload them in-process. Localizing
+    // against a different map means killing and relaunching the process.
+    CallbackReturn on_configure(const rclcpp_lifecycle::State &) override
     {
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
@@ -1589,7 +1621,6 @@ public:
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
-        auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
         // Load the prior map and arm the search BEFORE the scan pipeline starts,
         // so no scan is processed against an empty map. A missing or unreadable
         // map is fatal here: this node localizes, it has nothing to do without one.
@@ -1597,7 +1628,7 @@ public:
             RCLCPP_FATAL(this->get_logger(),
                 "localization.map_dir is required -- point it at a directory "
                 "holding pose.json and pcd/.");
-            throw std::runtime_error("localization.map_dir not set");
+            return CallbackReturn::FAILURE;
         }
         // Before load_prior_map: the map DB and the live scans must be described
         // with identical geometry or the descriptors are not comparable at all.
@@ -1611,7 +1642,9 @@ public:
                     map_dir_param.c_str(), map_pose_file_param.c_str(),
                     map_scan_dir_param.c_str());
         if (!load_prior_map(this->get_logger())) {
-            throw std::runtime_error("failed to load prior map from " + map_dir_param);
+            RCLCPP_FATAL(this->get_logger(),
+                "failed to load prior map from %s", map_dir_param.c_str());
+            return CallbackReturn::FAILURE;
         }
         global_map_kdtree.reset(new pcl::KdTreeFLANN<PointType>());
         global_map_kdtree->setInputCloud(global_map);
@@ -1622,9 +1655,11 @@ public:
             "Prior map ready (%zu pts). Searching for initial pose: ScanContext + "
             "ICP, %d estimates must agree within %.2f m.",
             global_map->size(), init_agree_count, init_agree_dist);
-        // Publish the prior map once, LATCHED (transient local) so RViz shows it
-        // on connect rather than only if it happens to be listening at startup.
-        // Downsampled for display only -- the ikd-Tree keeps the full cloud.
+        // Prior map display cloud, LATCHED (transient local) so RViz shows it on
+        // connect. Downsampled for display only -- the ikd-Tree keeps the full
+        // cloud. Built once here and cached; actually published from
+        // on_activate() since a LifecyclePublisher silently drops publish()
+        // calls made before it's activated.
         {
             rclcpp::QoS qos(1);
             qos.transient_local().reliable();
@@ -1634,13 +1669,10 @@ public:
             vg.setLeafSize(prior_map_view_leaf, prior_map_view_leaf, prior_map_view_leaf);
             vg.setInputCloud(global_map);
             vg.filter(*shown);
-            sensor_msgs::msg::PointCloud2 msg;
-            pcl::toROSMsg(*shown, msg);
-            msg.header.frame_id = map_frame;
-            msg.header.stamp = this->get_clock()->now();
-            pubPriorMap_->publish(msg);
+            pcl::toROSMsg(*shown, prior_map_msg_);
+            prior_map_msg_.header.frame_id = map_frame;
             RCLCPP_INFO(this->get_logger(),
-                "Published /prior_map on %s (%zu pts at %.2f m leaf, latched)",
+                "Prior map display cloud ready on %s (%zu pts at %.2f m leaf)",
                 map_frame.c_str(), shown->size(), prior_map_view_leaf);
         }
 
@@ -1731,28 +1763,128 @@ public:
                     tf_child_frame.c_str());
             });
 
+        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+        RCLCPP_INFO(this->get_logger(), "Configured. Waiting for activate() to start "
+                                         "processing and searching for a lock.");
+        return CallbackReturn::SUCCESS;
+    }
+
+    // Starts the pieces that make this node DO something: the scan-rate timer
+    // (so the iEKF loop runs at all), the periodic map/health timers, the
+    // background init-search thread, and the lifecycle publishers (inactive
+    // publishers silently drop everything, so activating them is what makes
+    // publish() calls elsewhere in this file actually emit anything).
+    CallbackReturn on_activate(const rclcpp_lifecycle::State &) override
+    {
+        pubLaserCloudFull_->on_activate();
+        pubLaserCloudFull_body_->on_activate();
+        pubLaserCloudEffect_->on_activate();
+        pubLaserCloudMap_->on_activate();
+        pubOdomAftMapped_->on_activate();
+        pubPath_->on_activate();
+        pubPriorMap_->on_activate();
+        pubLocalizationOverlap_->on_activate();
+        pubDiagnostics_->on_activate();
+        pub_localization_g->on_activate();
+
+        prior_map_msg_.header.stamp = this->get_clock()->now();
+        pubPriorMap_->publish(prior_map_msg_);
+
+        {
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            keep_searching = true;
+        }
         init_thread_ = std::thread(global_localization_thread, this->get_logger());
 
-        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
-
+        auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
+        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms,
+            std::bind(&LaserMappingNode::timer_callback, this));
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
-
+        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms,
+            std::bind(&LaserMappingNode::map_publish_callback, this));
         auto health_period_ms = std::chrono::milliseconds(
             static_cast<int64_t>(health_check_period_ * 1000.0));
         health_timer_ = rclcpp::create_timer(this, this->get_clock(), health_period_ms,
             std::bind(&LaserMappingNode::health_check_callback, this));
 
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        RCLCPP_INFO(this->get_logger(), "Activated. Searching for a lock.");
+        return CallbackReturn::SUCCESS;
+    }
 
-        RCLCPP_INFO(this->get_logger(), "Node init finished.");
+    // Inverse of on_activate(): stops the timers (so the iEKF loop and the
+    // periodic checks stop doing work), signals and joins the search thread,
+    // and deactivates the publishers. Lidar/IMU subscriptions and the
+    // /relocalize, /initialpose, map_save entry points stay alive -- they're
+    // harmless while inactive and this avoids re-subscribing on every
+    // activate/deactivate cycle.
+    CallbackReturn on_deactivate(const rclcpp_lifecycle::State &) override
+    {
+        timer_.reset();
+        map_pub_timer_.reset();
+        health_timer_.reset();
+
+        {
+            // NOT global_localization_finish = true here: the thread's outer
+            // loop checks keep_searching before it checks already_locked, so
+            // clearing keep_searching alone is enough to make it exit within
+            // one 20 Hz tick. Forcing a "locked" state that was never actually
+            // reached would leave init_result holding garbage, and the next
+            // on_activate()'s timer_callback would hand the filter that
+            // garbage pose on its very first tick.
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            keep_searching = false;
+        }
+        if (init_thread_.joinable()) init_thread_.join();
+
+        pubLaserCloudFull_->on_deactivate();
+        pubLaserCloudFull_body_->on_deactivate();
+        pubLaserCloudEffect_->on_deactivate();
+        pubLaserCloudMap_->on_deactivate();
+        pubOdomAftMapped_->on_deactivate();
+        pubPath_->on_deactivate();
+        pubPriorMap_->on_deactivate();
+        pubLocalizationOverlap_->on_deactivate();
+        pubDiagnostics_->on_deactivate();
+        pub_localization_g->on_deactivate();
+
+        RCLCPP_INFO(this->get_logger(), "Deactivated.");
+        return CallbackReturn::SUCCESS;
+    }
+
+    // NOT SUPPORTED -- see the class-level comment above on_configure(). The
+    // prior map, both ikd-Trees, and the filter state are process-global,
+    // shared with free functions this file inherits from upstream FAST-LIO
+    // (standard_pcl_cbk, imu_cbk, h_share_model, global_localization_thread,
+    // ...), so there is no member-scoped state to release here that would
+    // make a subsequent on_configure() safe to call again. Refusing is safer
+    // than silently reconfiguring onto stale globals.
+    CallbackReturn on_cleanup(const rclcpp_lifecycle::State &) override
+    {
+        RCLCPP_ERROR(this->get_logger(),
+            "on_cleanup is not supported by fast_lio_localization: the loaded "
+            "prior map and filter state are process-global and cannot be safely "
+            "released and reloaded in-process. Kill and relaunch the process to "
+            "localize against a different map.");
+        return CallbackReturn::FAILURE;
+    }
+
+    CallbackReturn on_shutdown(const rclcpp_lifecycle::State & state) override
+    {
+        if (state.id() == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+            on_deactivate(state);
+        }
+        return CallbackReturn::SUCCESS;
     }
 
     ~LaserMappingNode()
     {
-        {   // unblock the init thread if it is still searching
+        {   // see on_deactivate() for why this doesn't also force
+            // global_localization_finish -- harmless here since the process
+            // exits right after, but kept the same way to avoid this pattern
+            // getting copied somewhere it would matter.
             std::lock_guard<std::mutex> lk(init_state_mutex);
-            global_localization_finish = true;
+            keep_searching = false;
         }
         if (init_thread_.joinable()) init_thread_.join();
         fout_out.close();
@@ -2191,12 +2323,12 @@ private:
     }
 
 private:
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
+    rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+    rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
 #ifdef HAVE_LIVOX
@@ -2205,7 +2337,8 @@ private:
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     std::thread init_thread_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubPriorMap_;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubPriorMap_;
+    sensor_msgs::msg::PointCloud2 prior_map_msg_;   // built once in on_configure, published in on_activate
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_relocalize_;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
         sub_initialpose_;
@@ -2214,8 +2347,8 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     // Post-lock health check (see health_check_callback).
-    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pubLocalizationOverlap_;
-    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
+    rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Float32>::SharedPtr pubLocalizationOverlap_;
+    rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
     rclcpp::TimerBase::SharedPtr health_timer_;
     double health_min_overlap_   = 0.45;
     double health_bad_duration_  = 5.0;
@@ -2241,7 +2374,27 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    // This node supports being driven by an external lifecycle_manager, but
+    // nothing wires that up yet, so self-drive configure -> activate here to
+    // keep standalone launches (localization_l2.launch.py) working exactly as
+    // before: up and searching for a lock as soon as the process starts.
+    auto node = std::make_shared<LaserMappingNode>();
+    auto configured = node->configure();
+    if (configured.id() != lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+        RCLCPP_FATAL(node->get_logger(), "configure() failed (state: %s); exiting.",
+                     configured.label().c_str());
+        rclcpp::shutdown();
+        return 1;
+    }
+    auto activated = node->activate();
+    if (activated.id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+        RCLCPP_FATAL(node->get_logger(), "activate() failed (state: %s); exiting.",
+                     activated.label().c_str());
+        rclcpp::shutdown();
+        return 1;
+    }
+
+    rclcpp::spin(node->get_node_base_interface());
 
     if (rclcpp::ok())
         rclcpp::shutdown();
