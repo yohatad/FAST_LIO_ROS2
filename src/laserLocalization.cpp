@@ -1,18 +1,38 @@
 // FAST-LOCALIZATION for ROS 2 -- localization against a prior map, ported from
 // YWL0720/FAST-LOCALIZATION (ROS 1) onto this workspace's FAST-LIO2.
 //
-// WHY THIS EXISTS, AND HOW IT DIFFERS FROM lio_localization.
+// WHY THIS EXISTS, AND HOW IT DIFFERS FROM lio_localization (now removed; it
+// lives on at github.com/yohatad/lio_localization).
 //
-// lio_localization keeps FAST-LIO's own map and bolts a SEPARATE ICP node
-// beside it, which registers the scan against a prior .pcd every ~0.5 s and
-// emits a discrete map -> odom correction. That correction is a step, and the
+// lio_localization kept FAST-LIO's own map and bolted a SEPARATE ICP node
+// beside it, which registered the scan against a prior .pcd every ~0.5 s and
+// emitted a discrete map -> odom correction. That correction is a step, and the
 // step IS the jump: MEASURED on slam_20260823_aligned, 383 correction attempts,
 // 223 rejected by the innovation gate (58%), 100 forced through by the
-// 3-strike escape hatch, the largest 49.72 m, growing over the run -- i.e. it
-// diverged rather than settled. Fitness cannot catch this: inlierFitness is an
-// inlier COUNT at max_corr_dist (1.0 m) while the gate rejects at 0.30 m, so a
-// correction the gate calls implausible costs 0.000 fitness (measured: fitness
+// 3-strike escape hatch. Fitness cannot catch this: inlierFitness is an inlier
+// COUNT at max_corr_dist (1.0 m) while the gate rejected at 0.30 m, so a
+// correction the gate called implausible cost 0.000 fitness (measured: fitness
 // stays 1.000 out to a full 1.0 m of deliberate offset).
+//
+// CORRECTION to an earlier version of this note, which cited "the largest
+// 49.72 m, growing over the run" as evidence that it diverged. That magnitude
+// was mostly a measurement artifact, and the real defect is more instructive.
+// The gate differenced the TRANSLATION COLUMNS of successive map -> odom
+// transforms -- i.e. the ODOM ORIGIN's position in map, not the robot's. Since
+//     t_map_odom = p_map_base - R_corr * p_odom_base,
+// two corrections differing only in yaw differ in that column by roughly
+// |p_odom_base| * dtheta. This run ends 81.1 m from the odom origin, so ~35 deg
+// of yaw reads as ~49 m -- and because the lever arm grows monotonically as the
+// robot drives away from its start, CONSTANT yaw jitter reads as "growing over
+// the run". Worse, the budget it was compared against (odom_drift_rate, a
+// robot-POSITION bound) pinned to its 0.30 m floor, which at 50-80 m out is
+// 0.2-0.34 deg of allowed yaw -- below ICP's own yaw scatter. So late in a run
+// the gate rejected nearly everything regardless of match quality, which is
+// what the 223/383 and the 100 escape-hatch acceptances actually record.
+//
+// The conclusion below is unaffected -- a correction applied outside the filter
+// is a step, and a 35 deg yaw lock is still a wrong lock -- but the reported
+// magnitudes were lever-arm inflated and should not be quoted as pose error.
 //
 // This node removes the correction entirely. The prior map is loaded straight
 // into the ikd-Tree that FAST-LIO's iEKF registers against, so every scan is
@@ -37,8 +57,10 @@
 #include <atomic>
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <math.h>
+#include <cstdio>
 #include <thread>
 #include <fstream>
 #include <csignal>
@@ -1397,6 +1419,8 @@ public:
             this->create_publisher<nav_msgs::msg::Odometry>("/localization/pose", 10);
         pubLocalizationOverlap_ =
             this->create_publisher<std_msgs::msg::Float32>("/localization/overlap", 10);
+        pubDiagnostics_ =
+            this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
         tf_buffer_g = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         // spin_thread=true: the listener gets its OWN thread. Sharing this
         // node's single-threaded executor does not work -- the scan timer
@@ -2013,9 +2037,38 @@ private:
     // full health_bad_duration_ window -- meaning the robot moved and looked
     // at several different things and still isn't matching the map anywhere --
     // is treated as evidence of an actual wrong lock.
+    // Publishes one DiagnosticArray with a single "fastlio_localization: pose
+    // lock" status, so rqt_robot_monitor (or any diagnostic_updater consumer)
+    // shows this node continuously -- not just via log lines an operator has
+    // to be watching at the right moment.
+    void publish_diagnostic(uint8_t level, const std::string &message,
+                             const std::string &overlap_value = "")
+    {
+        diagnostic_msgs::msg::DiagnosticStatus status;
+        status.level = level;
+        status.name = "fastlio_localization: pose lock";
+        status.hardware_id = "fast_lio_localization";
+        status.message = message;
+        if (!overlap_value.empty()) {
+            diagnostic_msgs::msg::KeyValue kv;
+            kv.key = "map_overlap";
+            kv.value = overlap_value;
+            status.values.push_back(kv);
+        }
+        diagnostic_msgs::msg::DiagnosticArray arr;
+        arr.header.stamp = this->get_clock()->now();
+        arr.status.push_back(status);
+        pubDiagnostics_->publish(arr);
+    }
+
     void health_check_callback()
     {
-        if (!map_loaded || !global_update) return;
+        if (!map_loaded) return;
+        if (!global_update) {
+            publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::WARN,
+                                "Searching for initial pose (not yet localized)");
+            return;
+        }
         if (feats_down_body->empty()) return;
 
         // map <- lidar now, built the same way pointBodyToWorld does: state_point
@@ -2036,6 +2089,9 @@ private:
         ov_msg.data = static_cast<float>(ov);
         pubLocalizationOverlap_->publish(ov_msg);
 
+        char ov_str[16];
+        std::snprintf(ov_str, sizeof(ov_str), "%.2f", ov);
+
         const rclcpp::Time now = this->get_clock()->now();
         if (ov < health_min_overlap_) {
             if (!overlap_bad_) { overlap_bad_ = true; bad_since_ = now; }
@@ -2048,11 +2104,18 @@ private:
                     "[health] overlap stayed below %.0f%% for %.1f s -- this lock "
                     "looks wrong. Re-arming the global search (auto_relocalize).",
                     100.0 * health_min_overlap_, bad_for);
+                publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::ERROR,
+                    "Lock looks wrong; auto-relocalize re-armed the search", ov_str);
                 rearm_search();
                 overlap_bad_ = false;
+                return;
             }
+            publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::WARN,
+                "Overlap below threshold; watching before acting", ov_str);
         } else {
             overlap_bad_ = false;
+            publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::OK,
+                "Localized; tracking the prior map", ov_str);
         }
     }
 
@@ -2097,6 +2160,7 @@ private:
 
     // Post-lock health check (see health_check_callback).
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pubLocalizationOverlap_;
+    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
     rclcpp::TimerBase::SharedPtr health_timer_;
     double health_min_overlap_   = 0.45;
     double health_bad_duration_  = 5.0;
