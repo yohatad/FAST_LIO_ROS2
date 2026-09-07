@@ -180,6 +180,13 @@ std::vector<V3D, Eigen::aligned_allocator<V3D>> position_init;
 std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_init;
 std::queue<std::pair<int, PointCloudXYZI::Ptr>> init_feats_down_bodys;
 std::mutex init_feats_mutex, init_state_mutex;
+// Sliding window of accepted init candidates (see global_localization_thread).
+// Global rather than a local in that function so rearm_search() can drop it on
+// /relocalize -- otherwise a stale candidate from before the relocalize could
+// pair with a fresh one and produce a bogus instant "agreement".
+std::vector<int> candidate_ids;
+std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> candidate_poses;
+std::mutex candidate_mutex;
 bool  global_localization_finish = false;  // a lock has been found
 bool  global_update = false;               // the current lock has been APPLIED
 bool  map_swapped   = false;               // ikdtree already holds the prior map
@@ -1166,9 +1173,11 @@ void global_localization_thread(rclcpp::Logger log)
         if (already_locked) { rate.sleep(); continue; }
         if (!map_loaded) { rate.sleep(); continue; }
 
-        std::vector<int> ids;
-        std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
-        while ((int)ids.size() < init_agree_count && rclcpp::ok())
+        auto candidate_count = []() {
+            std::lock_guard<std::mutex> lk(candidate_mutex);
+            return (int)candidate_ids.size();
+        };
+        while (candidate_count() < init_agree_count && rclcpp::ok())
         {
             std::pair<int, PointCloudXYZI::Ptr> item;
             {
@@ -1239,24 +1248,45 @@ void global_localization_thread(rclcpp::Logger log)
             }
             // Motion gate: the new candidate must come from a scan the robot
             // has actually travelled from, or it is not independent evidence.
-            if (init_require_motion && !ids.empty()) {
+            int oldest_id = -1;
+            {
+                std::lock_guard<std::mutex> lk(candidate_mutex);
+                if (!candidate_ids.empty()) oldest_id = candidate_ids.front();
+            }
+            if (init_require_motion && oldest_id != -1) {
                 Eigen::Matrix4d T0, Tn;
-                if (!odom_at(ids[0], T0) || !odom_at(item.first, Tn)) continue;
+                if (!odom_at(oldest_id, T0) || !odom_at(item.first, Tn)) continue;
                 const double moved =
                     (Tn.block<3,1>(0,3) - T0.block<3,1>(0,3)).norm();
                 if (moved < init_motion_min) {
                     RCLCPP_INFO(log, "[init] holding: only %.2f m travelled since "
-                                     "the first estimate (need %.2f) -- move the robot",
+                                     "the oldest kept estimate (need %.2f) -- move the robot",
                                 moved, init_motion_min);
                     continue;
                 }
             }
-            poses.push_back(T_cand);
-            ids.push_back(item.first);
-            RCLCPP_INFO(log, "[init] candidate %zu/%d: matched map keyframe %d "
+            int kept_count;
+            {
+                std::lock_guard<std::mutex> lk(candidate_mutex);
+                candidate_poses.push_back(T_cand);
+                candidate_ids.push_back(item.first);
+                kept_count = (int)candidate_ids.size();
+            }
+            RCLCPP_INFO(log, "[init] candidate %d/%d: matched map keyframe %d "
                              "(%.0f%% overlap)",
-                        ids.size(), init_agree_count, match_id, 100.0 * ov);
+                        kept_count, init_agree_count, match_id, 100.0 * ov);
         }
+
+        std::vector<int> ids;
+        std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
+        {
+            std::lock_guard<std::mutex> lk(candidate_mutex);
+            ids = candidate_ids;
+            poses = candidate_poses;
+        }
+        // A concurrent /relocalize (or auto-relocalize) can have cleared the
+        // window while the loop above was mid-flight; re-check rather than
+        // trust the count that satisfied the while condition.
         if ((int)ids.size() < init_agree_count) continue;
 
         // Each pose is the map pose at ITS OWN scan, so comparing them raw
@@ -1293,13 +1323,31 @@ void global_localization_thread(rclcpp::Logger log)
                 std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
                 std::swap(init_feats_down_bodys, empty);
             }
+            {
+                std::lock_guard<std::mutex> lk(candidate_mutex);
+                candidate_ids.clear();
+                candidate_poses.clear();
+            }
             RCLCPP_INFO(log, "[init] LOCKED: %d estimates agree to %.2f m (limit %.2f)",
                         init_agree_count, spread, init_agree_dist);
             continue;   // idle until /relocalize re-arms us
         }
+        // Drop only the OLDEST candidate rather than the whole window: a
+        // persistently good match should not be discarded just because it was
+        // paired with one stale/bad one. With init_agree_count == 2 this means
+        // the next new candidate is compared against the one just kept, not a
+        // fresh pair from zero -- so a real, repeatable place is found in one
+        // extra scan instead of requiring two brand-new ones every time.
         RCLCPP_WARN(log, "[init] rejected: estimates disagree by %.2f m (limit %.2f) "
-                         "-- ambiguous place, retrying", spread, init_agree_dist);
-        ids.clear(); poses.clear();
+                         "-- ambiguous place, dropping the oldest and retrying",
+                    spread, init_agree_dist);
+        {
+            std::lock_guard<std::mutex> lk(candidate_mutex);
+            if (!candidate_ids.empty()) {
+                candidate_ids.erase(candidate_ids.begin());
+                candidate_poses.erase(candidate_poses.begin());
+            }
+        }
     }
 }
 
@@ -2015,6 +2063,13 @@ private:
             position_init.clear();
             pose_init.clear();
             init_count = 0;
+        }
+        {
+            // Otherwise a candidate accepted before this rearm could pair with
+            // a fresh one after it and produce a bogus instant "agreement".
+            std::lock_guard<std::mutex> lk(candidate_mutex);
+            candidate_ids.clear();
+            candidate_poses.clear();
         }
         {
             std::lock_guard<std::mutex> lk(init_state_mutex);
