@@ -12,10 +12,8 @@
 # The QoS overrides are REQUIRED: /imu/data and /camera/imu were recorded
 # BEST_EFFORT and a RELIABLE subscriber matches nothing against them.
 #
-# map_frame defaults to 'map', not stock FAST-LIO's 'camera_init'. That is not
-# cosmetic: after the handover the filter state IS in the prior map's frame, so
-# 'camera_init' (the LIO's own start frame) would name it wrongly -- the same
-# misnomer FRAMES.md warns about elsewhere in this workspace.
+# map_frame defaults to 'map', not stock FAST-LIO's 'camera_init': after the
+# handover the filter state IS in the prior map's frame.
 import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -30,10 +28,8 @@ def generate_launch_description():
     share = get_package_share_directory('fast_lio')
 
     args = [
-        # Split deliberately. pose.json IS the map's identity (233 KB) and ships
-        # tracked in pepper_navigation beside pepper_map_lc_poses.txt, so the two
-        # localization stacks' maps are visibly one set. The 2735 keyframe clouds
-        # are 75 MB of gitignored binary and live outside any package.
+        # Split deliberately: pose.json is small and git-tracked; the keyframe
+        # clouds are 75 MB of gitignored binary.
         DeclareLaunchArgument('map_dir',
             default_value=os.path.join(
                 get_package_share_directory('pepper_navigation'), 'pcd'),
@@ -43,19 +39,9 @@ def generate_launch_description():
                         'per run: this directory also holds the OTHER stack\'s '
                         'pepper_map_lc_poses.txt, and a second map would drop a '
                         'second pose file beside it.'),
-        # In pepper_navigation/pcd alongside pose.json, pepper_map_lc.pcd and
-        # pepper_map_lc_poses.txt: every artifact of one mapping run in one
-        # place, package-relative so it resolves on any machine rather than via
-        # an absolute /home/<user> path. The clouds are gitignored (75 MB) like
-        # pepper_map_lc.pcd is, and copied to a new machine the same way.
-        #
-        # In a subfolder named after the RUN, not a bare pcd/: pose.json indexes
-        # these by number, so two undifferentiated folders would be silently
-        # interchangeable -- the same class of bug as a .pcd paired with the
-        # wrong poses, which cost a day to find.
-        #
-        # Installing 2735 files sounds expensive and is not: CMake copies only
-        # what changed, so a rebuild after the first is ~0.5 s.
+        # Named after the RUN, not a bare pcd/: pose.json indexes these by
+        # number, so two undifferentiated folders would be silently
+        # interchangeable.
         DeclareLaunchArgument('map_scan_dir',
             default_value=os.path.join(
                 get_package_share_directory('pepper_navigation'),
@@ -68,18 +54,13 @@ def generate_launch_description():
                         'initial pose composition.'),
         DeclareLaunchArgument('use_sim_time', default_value='true',
             description='true for bag replay (this launch is bag-oriented).'),
-        DeclareLaunchArgument('rviz', default_value='true'),
-        DeclareLaunchArgument('map_frame', default_value='map'),
-        # l2_rsimu.yaml sets publish_tf:=false, because in the MAPPING stack
-        # lio_odom_bridge owns map/odom/base_footprint and a second broadcaster
-        # would fight it. Standalone, this node is the only authority on
-        # map -> body, so nothing publishes the 'map' frame unless it does --
-        # RViz then reports "frame [map] does not exist" and shows nothing.
-        # Set false again if you later run this alongside lio_odom_bridge.
-        # REP-105: map -> base_footprint, not map -> the IMU on the mast. The
-        # bag's /tf_static already owns base_footprint -> camera_imu_optical_-
-        # frame, so broadcasting the IMU edge here as well would give it two
-        # parents and split the TF tree.
+        DeclareLaunchArgument('rviz', default_value='true',
+            description='Open RViz2 pre-configured for this stack.'),
+        DeclareLaunchArgument('map_frame', default_value='map',
+            description='Frame name for the published map -> body edge.'),
+        # Standalone, this node is the only authority on map -> body, so
+        # publish_tf defaults true here. Set false if running alongside
+        # lio_odom_bridge, which owns those frames in the mapping stack.
         DeclareLaunchArgument('tf_child_frame', default_value='base_footprint',
             description='Child of the broadcast map edge. The body->child '
                         'extrinsic is read from /tf_static once and cached.'),
@@ -89,35 +70,40 @@ def generate_launch_description():
         # ScanContext descriptor geometry. Defaults are sized to the L2, whose
         # keyframes hold ~1600 pts with 90% inside 3.3 m and only 0.08% beyond
         # 10 m -- upstream's 80 m / 20x60 leaves most of the descriptor empty.
-        DeclareLaunchArgument('sc_max_radius', default_value='10.0'),
-        DeclareLaunchArgument('sc_num_ring', default_value='12'),
-        DeclareLaunchArgument('sc_num_sector', default_value='40'),
-        DeclareLaunchArgument('sc_lidar_height', default_value='0.5'),
-        DeclareLaunchArgument('sc_dist_thres', default_value='0.15'),
+        DeclareLaunchArgument('sc_max_radius', default_value='10.0',
+            description='ScanContext descriptor radius, metres.'),
+        DeclareLaunchArgument('sc_num_ring', default_value='12',
+            description='ScanContext descriptor ring count.'),
+        DeclareLaunchArgument('sc_num_sector', default_value='40',
+            description='ScanContext descriptor sector count.'),
+        DeclareLaunchArgument('sc_lidar_height', default_value='0.5',
+            description='Lidar height above ground, metres.'),
+        DeclareLaunchArgument('sc_dist_thres', default_value='0.15',
+            description='ScanContext match distance threshold.'),
         # A single ScanContext hit in a corridor is not evidence. Require this
         # many independent locks agreeing within init_agree_dist.
-        DeclareLaunchArgument('init_agree_count', default_value='2'),
-        DeclareLaunchArgument('init_agree_dist', default_value='2.0'),
-        # Agreement alone cannot catch a wrong lock: two matches to the SAME
-        # wrong place agree perfectly. MEASURED starting mid-corridor, it locked
-        # 41 m from truth on two mutually-consistent matches. These ask the map
-        # instead -- what fraction of the scan lands on it at the proposed pose.
-        # OFF by default. Agreement between two estimates taken from a
-        # STANDSTILL is close to vacuous -- the scans are near-identical, so of
-        # course they agree -- and with it off, an unseeded start in a
-        # self-similar place CAN lock wrongly (MEASURED: 41 m out, on two
-        # mutually-consistent matches). Turn it ON for unattended startup with
-        # no seed. It is off by default because a seeded start via /initialpose
-        # needs no disambiguation, and requiring the robot to drive 0.5 m before
-        # nav2 can come up is the wrong trade when an operator is present.
-        DeclareLaunchArgument('init_require_motion', default_value='false'),
+        DeclareLaunchArgument('init_agree_count', default_value='2',
+            description='Independent ScanContext locks required to agree.'),
+        DeclareLaunchArgument('init_agree_dist', default_value='2.0',
+            description='Metres within which agreeing locks must match.'),
+        # Agreement alone can't catch two matches that agree on the SAME wrong
+        # place (MEASURED: 41 m off in a corridor). require_motion forces the
+        # two estimates apart in space so agreement means something; off by
+        # default since a seeded /initialpose start doesn't need it. Turn on
+        # for unattended startup with no seed.
+        DeclareLaunchArgument('init_require_motion', default_value='false',
+            description='Require motion between agreeing estimates before '
+                        'accepting a lock (guards against vacuous standstill '
+                        'agreement).'),
         DeclareLaunchArgument('init_motion_min', default_value='0.50',
             description='Metres of odometry required between the agreeing '
                         'estimates. Only used when init_require_motion.'),
-        DeclareLaunchArgument('init_min_overlap', default_value='0.70'),
+        DeclareLaunchArgument('init_min_overlap', default_value='0.70',
+            description='Minimum fraction of the scan that must overlap the '
+                        'map at the proposed pose.'),
         DeclareLaunchArgument('init_overlap_dist', default_value='0.20',
-            description='Metres. Keep this TIGHT: at 1.0 m a pose 41 m out still '
-                        'scored 97% against this dense map.'),
+            description='Metres. Keep TIGHT -- looser values let a wrong lock '
+                        'still score a high overlap.'),
     ]
 
     node = Node(
@@ -127,10 +113,8 @@ def generate_launch_description():
             os.path.join(share, 'config', 'l2_rsimu.yaml'),
             {'use_sim_time': LaunchConfiguration('use_sim_time'),
              'publish.map_frame': LaunchConfiguration('map_frame'),
-             # ParameterValue with an explicit type: the node declares this as a
-             # bool, and a bare LaunchConfiguration arrives as the STRING
-             # 'true', which ROS 2 rejects on type -- silently leaving
-             # publish_tf at the config's false, so no 'map' frame ever appears.
+             # Explicit type: a bare LaunchConfiguration arrives as a string,
+             # which the node's bool parameter rejects.
              'publish.publish_tf': ParameterValue(
                  LaunchConfiguration('publish_tf'), value_type=bool),
              'publish.tf_child_frame': LaunchConfiguration('tf_child_frame'),
