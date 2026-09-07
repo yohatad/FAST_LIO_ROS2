@@ -36,6 +36,7 @@
 #include <mutex>
 #include <atomic>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <math.h>
 #include <thread>
@@ -1376,11 +1377,26 @@ public:
         this->get_parameter("localization.init_overlap_dist", init_overlap_dist);
         this->declare_parameter<double>("localization.prior_map_view_leaf", 0.20);
         this->get_parameter("localization.prior_map_view_leaf", prior_map_view_leaf);
+        // Post-lock health check: re-runs map_overlap() periodically against the
+        // LIVE tracked pose (see health_check_callback). A wrong-but-self-
+        // consistent lock produces no other symptom -- effct_feat_num stays
+        // healthy because a self-similar place still looks like a plausible
+        // match -- so nothing else in this node would ever notice one.
+        this->declare_parameter<double>("localization.health_min_overlap", 0.45);
+        this->declare_parameter<double>("localization.health_bad_duration", 5.0);
+        this->declare_parameter<double>("localization.health_check_period", 1.0);
+        this->declare_parameter<bool>("localization.auto_relocalize", true);
+        this->get_parameter("localization.health_min_overlap", health_min_overlap_);
+        this->get_parameter("localization.health_bad_duration", health_bad_duration_);
+        this->get_parameter("localization.health_check_period", health_check_period_);
+        this->get_parameter("localization.auto_relocalize", auto_relocalize_);
         this->declare_parameter<std::string>("publish.tf_child_frame", "base_footprint");
         this->get_parameter("publish.tf_child_frame", tf_child_frame);
         node_g = this;
         pub_localization_g =
             this->create_publisher<nav_msgs::msg::Odometry>("/localization/pose", 10);
+        pubLocalizationOverlap_ =
+            this->create_publisher<std_msgs::msg::Float32>("/localization/overlap", 10);
         tf_buffer_g = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         // spin_thread=true: the listener gets its OWN thread. Sharing this
         // node's single-threaded executor does not work -- the scan timer
@@ -1578,20 +1594,7 @@ public:
                     res->message = "prior map not loaded";
                     return;
                 }
-                {   // drop the odometry trail: it indexes scans from the OLD
-                    // search, and the new lock will index into this vector.
-                    std::lock_guard<std::mutex> lk(init_feats_mutex);
-                    std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
-                    std::swap(init_feats_down_bodys, empty);
-                    position_init.clear();
-                    pose_init.clear();
-                    init_count = 0;
-                }
-                {
-                    std::lock_guard<std::mutex> lk(init_state_mutex);
-                    global_localization_finish = false;   // re-arm the search
-                }
-                global_update = false;                    // allow a new teleport
+                rearm_search();
                 RCLCPP_WARN(this->get_logger(),
                     "/relocalize: searching again. The pose is NOT trustworthy "
                     "until the next 'Localized' line.");
@@ -1662,6 +1665,11 @@ public:
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+
+        auto health_period_ms = std::chrono::milliseconds(
+            static_cast<int64_t>(health_check_period_ * 1000.0));
+        health_timer_ = rclcpp::create_timer(this, this->get_clock(), health_period_ms,
+            std::bind(&LaserMappingNode::health_check_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
@@ -1971,6 +1979,83 @@ private:
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
+    // Shared by /relocalize and the auto-triggered path in health_check_callback:
+    // drop the odometry trail (it indexes scans from the OLD search) and stand
+    // the current lock down so global_localization_thread starts over.
+    void rearm_search()
+    {
+        {
+            std::lock_guard<std::mutex> lk(init_feats_mutex);
+            std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
+            std::swap(init_feats_down_bodys, empty);
+            position_init.clear();
+            pose_init.clear();
+            init_count = 0;
+        }
+        {
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            global_localization_finish = false;   // re-arm the search
+        }
+        global_update = false;                    // allow a new teleport
+    }
+
+    // Runs at health_check_period_ Hz, only once locked. Re-scores the CURRENT
+    // tracked pose against the prior map with the same map_overlap() used
+    // during init, and publishes it on /localization/overlap so an operator (or
+    // a watchdog) has a continuous confidence signal instead of only the
+    // one-shot "Localized" log line.
+    //
+    // A single low reading is expected and not acted on -- turning a corner
+    // into an unmapped side room, a person crossing the scan, or driving past
+    // the map's edge all dip overlap for a scan or two on a CORRECT lock, and
+    // reacting to that would spuriously re-trigger the search during normal
+    // operation. Only overlap that stays below health_min_overlap_ for the
+    // full health_bad_duration_ window -- meaning the robot moved and looked
+    // at several different things and still isn't matching the map anywhere --
+    // is treated as evidence of an actual wrong lock.
+    void health_check_callback()
+    {
+        if (!map_loaded || !global_update) return;
+        if (feats_down_body->empty()) return;
+
+        // map <- lidar now, built the same way pointBodyToWorld does: state_point
+        // is map <- IMU post-handover, and offset_R_L_I/offset_T_L_I is the
+        // filter's live (possibly online-calibrated) IMU <- lidar extrinsic.
+        Eigen::Matrix4d T_body_now = Eigen::Matrix4d::Identity();
+        T_body_now.block<3,3>(0,0) = state_point.rot.toRotationMatrix();
+        T_body_now.block<3,1>(0,3) = state_point.pos;
+        Eigen::Matrix4d T_i_l = Eigen::Matrix4d::Identity();
+        T_i_l.block<3,3>(0,0) = state_point.offset_R_L_I.toRotationMatrix();
+        T_i_l.block<3,1>(0,3) = state_point.offset_T_L_I;
+        const Eigen::Matrix4d T_map_lidar = T_body_now * T_i_l;
+
+        const double ov = map_overlap(feats_down_body, T_map_lidar);
+        last_overlap_ = ov;
+
+        std_msgs::msg::Float32 ov_msg;
+        ov_msg.data = static_cast<float>(ov);
+        pubLocalizationOverlap_->publish(ov_msg);
+
+        const rclcpp::Time now = this->get_clock()->now();
+        if (ov < health_min_overlap_) {
+            if (!overlap_bad_) { overlap_bad_ = true; bad_since_ = now; }
+            const double bad_for = (now - bad_since_).seconds();
+            RCLCPP_WARN(this->get_logger(),
+                "[health] overlap %.0f%% (need %.0f%%), bad for %.1f s (limit %.1f)",
+                100.0 * ov, 100.0 * health_min_overlap_, bad_for, health_bad_duration_);
+            if (auto_relocalize_ && bad_for >= health_bad_duration_) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[health] overlap stayed below %.0f%% for %.1f s -- this lock "
+                    "looks wrong. Re-arming the global search (auto_relocalize).",
+                    100.0 * health_min_overlap_, bad_for);
+                rearm_search();
+                overlap_bad_ = false;
+            }
+        } else {
+            overlap_bad_ = false;
+        }
+    }
+
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
@@ -2009,6 +2094,17 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+
+    // Post-lock health check (see health_check_callback).
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pubLocalizationOverlap_;
+    rclcpp::TimerBase::SharedPtr health_timer_;
+    double health_min_overlap_   = 0.45;
+    double health_bad_duration_  = 5.0;
+    double health_check_period_  = 1.0;
+    bool   auto_relocalize_      = true;
+    bool   overlap_bad_          = false;
+    double last_overlap_         = 1.0;
+    rclcpp::Time bad_since_;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
