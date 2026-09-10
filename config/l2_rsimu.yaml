@@ -108,15 +108,18 @@
             scan_publish_en:  true
             dense_publish_en: false
             scan_bodyframe_pub_en: true
-            # NOTE: localization_l2.launch.py passes publish.publish_tf and
-            # publish.map_frame in its inline parameter dict, which is listed
-            # AFTER this file and therefore WINS -- even when the launch arg is
-            # left at its default. These two were stale copies from the mapping
-            # config (false / "lio_init") and silently had no effect. They now
-            # match the launch so the two cannot diverge; override on the
-            # command line (publish_tf:=..., map_frame:=...), not here.
-            publish_tf: true
-            map_frame: "map"
+            # Mapping / odometry values. lio_odom_bridge owns lio_init ->
+            # base_footprint and requires FAST-LIO's own TF broadcast OFF with
+            # the odometry in lio_init (see its docstring). With true / "map",
+            # FAST-LIO broadcast map -> camera_imu_optical_frame, reparenting
+            # the frame pepper_sensor_tf publishes under camera_imu_frame and
+            # splitting the TF tree: octomap_server's ground filter failed on
+            # every scan in fastlio_lc_l2 and the bridge warned "Odometry
+            # frame_id 'map' != odom_frame 'lio_init'". localization_l2.launch.py
+            # sets both inline, listed after this file so it wins -- change
+            # them there, not here.
+            publish_tf: false
+            map_frame: "lio_init"
             # CHANGED from l2lidar_frame_imu: /Odometry's child_frame_id is the
             # IMU body frame, which is now the camera's. sensor_tf.yaml already
             # publishes base_footprint -> l2lidar_frame -> camera_camera_link ->
