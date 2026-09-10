@@ -1,3 +1,6 @@
+#pragma once
+// Include guard added: this header defines a class and free functions, and is
+// now reachable twice in one translation unit (directly, and via lio_core.hpp).
 #include <cmath>
 #include <math.h>
 #include <deque>
