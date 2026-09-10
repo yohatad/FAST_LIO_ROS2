@@ -41,77 +41,99 @@
 // mapping's also emits /localization/pose with a lever-arm-corrected
 // twist), the initial-pose search thread, and the lifecycle node.
 
-/*** FAST-LOCALIZATION state ***/
-SCManager scManager;                       // ScanContext descriptor DB of the prior map
-PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
-KD_TREE<PointType>::Ptr ikdtree_global(new KD_TREE<PointType>());  // prior map as an ikd-Tree, moved into ikdtree on lock
-std::vector<V3D, Eigen::aligned_allocator<V3D>> position_map;   // keyframe positions (map)
-std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_map;
-// Odometry trail during the init phase. A ScanContext match names a SCAN, not
-// "now", so its pose must be carried forward by the odometry accumulated since.
-std::vector<V3D, Eigen::aligned_allocator<V3D>> position_init;
-std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_init;
-std::queue<std::pair<int, PointCloudXYZI::Ptr>> init_feats_down_bodys;
-std::mutex init_feats_mutex, init_state_mutex;
-// Sliding window of accepted init candidates (see global_localization_thread).
-// Global so rearm_search() can drop it on /relocalize.
-std::vector<int> candidate_ids;
-std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> candidate_poses;
-std::mutex candidate_mutex;
-bool  global_localization_finish = false;  // a lock has been found
-bool  global_update = false;               // the current lock has been APPLIED
-// Cleared by on_deactivate() to stop global_localization_thread. Distinct from
-// global_localization_finish ("found a lock", not "stop running").
-bool  keep_searching = true;
-bool  map_swapped   = false;               // ikdtree already holds the prior map
-std::atomic<bool> relocalize_requested{false};
-// A pose handed in on /initialpose, waiting to be applied by the scan pipeline.
-// Applied as-is, unlike a ScanContext lock, which names a past scan and must be
-// carried forward by the odometry since.
-std::mutex seed_mutex;
-Eigen::Matrix4d pending_seed = Eigen::Matrix4d::Identity();
+/*** ================= FAST-LOCALIZATION state =================
+ *** All file-scope, because the free functions below and the search thread
+ *** both reach them. Mutex-guarded groups say which lock covers them. ***/
+
+// Shorthands: these Eigen types need an aligned allocator in a std::vector,
+// which makes the declarations too wide to read otherwise.
+using PosVec  = std::vector<V3D, Eigen::aligned_allocator<V3D>>;
+using QuatVec = std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>>;
+using PoseVec = std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>>;
+
+/* --- prior map: loaded once in on_configure(), read-only afterwards --- */
+SCManager                        scManager;             // ScanContext descriptor DB of the map
+PointCloudXYZI::Ptr              global_map(new PointCloudXYZI());  // all keyframes, in map frame
+pcl::KdTreeFLANN<PointType>::Ptr global_map_kdtree;      // over global_map; backs map_overlap()
+KD_TREE<PointType>::Ptr          ikdtree_global(new KD_TREE<PointType>());  // moved into ikdtree on lock
+PosVec                           position_map;          // keyframe positions, map frame
+QuatVec                          pose_map;              // keyframe orientations, map frame
+bool                             map_loaded = false;    // prior map is in memory and usable
+
+/* --- init-phase odometry trail + scan queue --- guarded by init_feats_mutex ---
+   A ScanContext match names a SCAN, not "now", so its pose must be carried
+   forward by the odometry accumulated since. Trail and queue are ONE unit: the
+   id queued with a scan indexes into the trail. */
+PosVec      position_init;                              // odom position at each init scan
+QuatVec     pose_init;                                  // odom orientation at each init scan
+std::queue<std::pair<int, PointCloudXYZI::Ptr>> init_feats_down_bodys;  // {id, scan}, capped at 5
+int         init_count = 0;                             // next trail id == trail length
+std::mutex  init_feats_mutex;
+
+/* --- candidate window --- guarded by candidate_mutex ---
+   Accepted estimates awaiting agreement; rearm_search() drops it on /relocalize. */
+std::vector<int> candidate_ids;                         // trail id each candidate came from
+PoseVec          candidate_poses;                       // map <- IMU at that candidate's scan
+std::mutex       candidate_mutex;
+
+/* --- search state --- guarded by init_state_mutex --- */
+bool       global_localization_finish = false;          // a lock has been FOUND
+bool       keep_searching = true;                       // on_deactivate() clears this to stop the thread
+std::mutex init_state_mutex;
+std::pair<int, Eigen::Matrix4d> init_result;            // {trail id, map <- IMU} of the accepted lock
+
+/* --- handover state --- scan-timer thread only --- */
+bool global_update = false;                             // the current lock has been APPLIED
+bool map_swapped   = false;                             // ikdtree holds the prior map; never reset
+std::atomic<bool> relocalize_requested{false};          // /relocalize asked for a re-arm
+
+/* --- /initialpose seed --- guarded by seed_mutex ---
+   Applied as-is, unlike a ScanContext lock, which names a past scan. */
+std::mutex        seed_mutex;
+Eigen::Matrix4d   pending_seed = Eigen::Matrix4d::Identity();
 std::atomic<bool> has_pending_seed{false};
-int   init_count = 0;
-std::pair<int, Eigen::Matrix4d> init_result;
-// pose.json is the map's identity and lives tracked in pepper_navigation; the
-// keyframe clouds are bulk binary and are addressed separately.
-std::string map_dir_param;                 // holds the pose file
-std::string map_pose_file_param;           // pose file; bare name or absolute path
-std::string map_scan_dir_param;            // holds <N>.pcd; defaults to <map_dir>/pcd
-int    init_agree_count = 2;               // independent locks that must agree
-double init_agree_dist  = 2.0;             // metres they must agree within
-double init_icp_coarse  = 5.0, init_icp_fine = 1.0;
-// ScanContext descriptor geometry -- sized to THIS sensor, not upstream's
-// 64-beam car lidar. See the note in Scancontext.h.
-double sc_lidar_height = 0.5, sc_max_radius = 10.0, sc_dist_thres = 0.15;
-// Gates on a candidate lock. init_min_overlap is the fraction of the scan that
-// must land within init_overlap_dist of the prior map; the tolerance is tight
-// because a loose one saturates (at 1.0 m a lock 41 m out still scored ~100%).
-// init_require_motion additionally demands the agreeing estimates come from
-// scans the robot moved between -- two near-identical scans agree trivially.
-// Default OFF: it blocks a stationary start, wrong when /initialpose is used.
-bool   init_require_motion = false;
-double init_motion_min = 0.50;    // metres of odometry between the two scans
-double init_min_overlap = 0.70;
-double init_overlap_dist = 0.20;  // metres; a point nearer than this is "on the map"
-pcl::KdTreeFLANN<PointType>::Ptr global_map_kdtree;
-int    sc_num_ring = 12, sc_num_sector = 40;
-double prior_map_view_leaf = 0.20;   // display-only downsample for /prior_map
-// TF child frame. FAST-LIO natively broadcasts map -> <body_frame> (the IMU),
-// but REP-105 wants map -> base_footprint, and /tf_static already parents the
-// IMU frame -- broadcasting it too would split the tree.
-std::string tf_child_frame;                 // "" => broadcast body_frame as-is
-bool  tf_child_resolved = false;
-M3D   R_body_to_tfchild(Eye3d);
-V3D   t_body_to_tfchild(0, 0, 0);
-std::shared_ptr<tf2_ros::Buffer> tf_buffer_g;
-// Logging from the free functions goes through lio_core.hpp's lio_logger()/
-// lio_clock(), pointed at this node in on_configure(). This used to be a
-// node pointer plus a local lio_logger()/this_clock() pair, duplicating what
-// the shared header already provides.
+
+/* --- prior map location (parameters) ---
+   pose.json is the map's identity and is tracked in pepper_navigation; the
+   keyframe clouds are bulk binary and are addressed separately. */
+std::string map_dir_param;                              // directory holding the pose file
+std::string map_pose_file_param;                        // pose file; bare name or absolute path
+std::string map_scan_dir_param;                         // holds <N>.pcd; default <map_dir>/pcd
+
+/* --- initial-pose search tuning (parameters) --- */
+int    init_agree_count   = 2;                          // independent estimates that must agree
+double init_agree_dist    = 2.0;                        // m they must agree within, odometry-compensated
+double init_icp_coarse    = 5.0;                        // m max correspondence, pass 1 (survives a metres-off hit)
+double init_icp_fine      = 1.0;                        // m max correspondence, pass 2 (the answer)
+double init_min_overlap   = 0.70;                       // fraction of the scan that must land on the map
+double init_overlap_dist  = 0.20;                       // m; nearer than this counts as "on the map"
+                                                        //   keep tight: at 1.0 m a lock 41 m out scored ~100%
+bool   init_require_motion = false;                     // demand travel between agreeing estimates
+                                                        //   OFF: it blocks a stationary /initialpose start
+double init_motion_min    = 0.50;                       // m of odometry between them when ON
+
+/* --- ScanContext descriptor geometry (parameters) ---
+   Sized to THIS sensor, not upstream's 64-beam car lidar; see Scancontext.h. */
+double sc_lidar_height = 0.5;                           // m added to z so bins are ground-referenced
+double sc_max_radius   = 10.0;                          // m; outermost ring
+double sc_dist_thres   = 0.15;                          // cosine distance below which a match is accepted
+int    sc_num_ring     = 12;                            // radial bins
+int    sc_num_sector   = 40;                            // angular bins; yaw resolution is 360/this
+
+/* --- TF child frame ---
+   FAST-LIO natively broadcasts map -> <body_frame> (the IMU), but REP-105 wants
+   map -> base_footprint, and /tf_static already parents the IMU frame --
+   broadcasting it too would split the tree. */
+std::string tf_child_frame;                             // "" => broadcast body_frame as-is
+bool        tf_child_resolved = false;                  // the static extrinsic below is cached
+M3D         R_body_to_tfchild(Eye3d);
+V3D         t_body_to_tfchild(0, 0, 0);
+
+/* --- node-scope handles, set in on_configure() --- */
+std::shared_ptr<tf2_ros::Buffer>             tf_buffer_g;
+std::shared_ptr<tf2_ros::TransformListener>  tf_listener_g;
 rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pub_localization_g;
-std::shared_ptr<tf2_ros::TransformListener> tf_listener_g;
-bool   map_loaded = false;
+double prior_map_view_leaf = 0.20;                      // display-only downsample for /prior_map
 
 /*** Resolve the STATIC body -> tf_child extrinsic, once, and cache it.
  ***

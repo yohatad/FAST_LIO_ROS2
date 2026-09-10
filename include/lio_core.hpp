@@ -1,32 +1,17 @@
 #pragma once
 // =============================================================================
-//  lio_core.hpp -- the FAST-LIO estimator core, shared by both nodes.
+//  lio_core.hpp -- FAST-LIO estimator core, shared by fastlio_mapping and
+//  fastlio_localization. They were independent copies; ~1165 lines were
+//  byte-identical, so every fix had to be made twice.
 //
-//  fastlio_mapping (laserMapping.cpp) and fastlio_localization
-//  (laserLocalization.cpp) ran as independent copies of this code: ~1165 lines
-//  were byte-identical between them, so every fix had to be made twice and any
-//  missed one was a silent divergence. This header is that common half, now
-//  edited in one place.
-//
-//  What lives here: the global estimator state, the sensor callbacks and their
-//  buffers, scan/IMU synchronisation, the ikd-Tree local map and its FOV
-//  pruning, the point-to-plane measurement model (h_share_model), and the
-//  cloud/path publishers.
-//
-//  What deliberately does NOT: publish_odometry(), because the two genuinely
-//  differ -- localization additionally resolves a TF child frame and publishes
-//  /localization/pose with a lever-arm-corrected twist. Each node defines its
-//  own, and each node owns its node class and main().
-//
-//  The publishers are templated on the publisher type rather than naming it:
-//  fastlio_mapping is a plain rclcpp::Node with rclcpp::Publisher, while
-//  fastlio_localization is a LifecycleNode with LifecyclePublisher. Both expose
-//  ->publish(msg), which is all these functions need.
-//
-//  This header defines its globals rather than declaring them extern. That is
-//  intentional and safe here: the two nodes are separate executables and each
-//  includes this header in exactly one translation unit, so no ODR conflict can
-//  arise. It keeps the diff to pure code motion.
+//  Here:     estimator globals, sensor callbacks + buffers, scan/IMU sync,
+//            ikd-Tree local map + FOV pruning, h_share_model, cloud/path pubs.
+//  Not here: publish_odometry() -- localization's also resolves a TF child
+//            frame and emits /localization/pose. Each node keeps its own,
+//            plus its node class and main().
+//  Note:     publishers are templated (Node vs LifecycleNode publish through
+//            different types); globals are defined, not extern -- each node is
+//            a separate executable including this in exactly one TU.
 // =============================================================================
 
 #include <omp.h>
@@ -82,9 +67,7 @@ float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
 
-// Shared code logs through ROS, not printf, so its output is throttleable and
-// carries the node name. Each node overwrites these in its constructor; the
-// defaults keep logging safe before that and in unit contexts with no node.
+// ROS logging for the free functions; each node points these at itself.
 rclcpp::Logger           lio_logger_ = rclcpp::get_logger("fast_lio");
 rclcpp::Clock::SharedPtr lio_clock_  = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
 inline rclcpp::Logger lio_logger() { return lio_logger_; }
@@ -130,12 +113,9 @@ PointCloudXYZI::Ptr _featsArray;
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
-// Held by pointer, not by value. KD_TREE owns raw nodes, a pthread created
-// with `this`, and six mutexes; it declares a destructor and no assignment
-// operators, which suppresses its implicit MOVE but leaves the implicit COPY,
-// so assigning one tree to another silently copy-assigns and double-frees the
-// node graph. laserLocalization.cpp does exactly that on its map handover.
-// Both nodes use the same ownership so the two cannot drift apart again.
+// By pointer: KD_TREE has a destructor and no assignment operators, so its
+// implicit move is suppressed and `a = std::move(b)` silently copy-assigns and
+// double-frees. laserLocalization does exactly that on its map handover.
 KD_TREE<PointType>::Ptr ikdtree(new KD_TREE<PointType>());
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
@@ -618,11 +598,8 @@ void publish_map(PubCloudT pubLaserCloudMap)
     }
     *pcl_wait_pub += *laserCloudWorld;
 
-    // Bounded: this used to append every scan and re-serialise the WHOLE
-    // accumulation once a second, growing memory and bandwidth linearly for the
-    // life of the process. Downsampling makes it converge to the size of the
-    // space visited; the cap is a backstop. save_to_pcd() writes this cloud, so
-    // filter_size_map_min also sets the resolution of a service-saved map.
+    // Bounded: this used to grow without limit. Downsampling converges it to the
+    // space visited, the cap is a backstop. Also sets save_to_pcd()'s resolution.
     {
         pcl::VoxelGrid<PointType> vg;
         const float leaf = filter_size_map_min > 0 ? filter_size_map_min : 0.2f;
@@ -647,12 +624,6 @@ void publish_map(PubCloudT pubLaserCloudMap)
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = map_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
 }
 
 void save_to_pcd()
