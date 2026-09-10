@@ -1151,22 +1151,42 @@ private:
             }
 
             {
-                std::unique_lock<std::mutex> lk(init_state_mutex);
-                const bool locked = global_localization_finish;
-                lk.unlock();
-                if (locked && !global_update)
+                /*** init_result is published BEFORE global_localization_finish
+                 *** under this mutex, so copying both here is the acquire side
+                 *** of that release -- and it stops /relocalize, which re-arms
+                 *** from the executor thread, republishing init_result midway
+                 *** through this read. ***/
+                int id = -1;
+                Eigen::Matrix4d T_cand = Eigen::Matrix4d::Identity();
+                bool locked = false;
                 {
-                    const int id = init_result.first;
-                    Eigen::Matrix4d T_odom_lock = Eigen::Matrix4d::Identity();
-                    T_odom_lock.block<3,3>(0,0) = pose_init[id].toRotationMatrix();
-                    T_odom_lock.block<3,1>(0,3) = position_init[id];
-
+                    std::lock_guard<std::mutex> lk(init_state_mutex);
+                    locked = global_localization_finish;
+                    if (locked) { id = init_result.first; T_cand = init_result.second; }
+                }
+                // odom_at() does the locked, bounds-checked read this file already
+                // uses everywhere else. rearm_search() clears the trail from
+                // another thread, so an unchecked pose_init[id] is an
+                // out-of-range vector read.
+                Eigen::Matrix4d T_odom_lock;
+                bool trail_ok = false;
+                if (locked && !global_update) {
+                    trail_ok = odom_at(id, T_odom_lock);
+                    if (!trail_ok) {
+                        RCLCPP_WARN(this->get_logger(),
+                            "[init] lock references trail entry %d but the trail was "
+                            "re-armed underneath it; discarding.", id);
+                        rearm_search();
+                    }
+                }
+                if (trail_ok)
+                {
                     Eigen::Matrix4d T_odom_now = Eigen::Matrix4d::Identity();
                     T_odom_now.block<3,3>(0,0) = state_point.rot.toRotationMatrix();
                     T_odom_now.block<3,1>(0,3) = state_point.pos;
 
                     const Eigen::Matrix4d T_map_now =
-                        init_result.second * T_odom_lock.inverse() * T_odom_now;
+                        T_cand * T_odom_lock.inverse() * T_odom_now;
 
                     // The handover is a change of WORLD FRAME, not just a pose
                     // edit, so every world-frame quantity has to rotate with it
@@ -1322,10 +1342,14 @@ private:
                     // lock would race the search thread and /relocalize's clear.
                     position_init.push_back(state_point.pos);
                     pose_init.push_back(state_point.rot);
-                    // Bounded: ScanContext + two ICP passes is slower than the
-                    // scan rate, so an unbounded queue would only grow staler.
-                    if (init_feats_down_bodys.size() < 5)
-                        init_feats_down_bodys.push({init_count, snapshot});
+                    // Bounded, and biased to the NEWEST scans: ScanContext plus
+                    // two ICP passes are slower than the scan rate, so dropping
+                    // new arrivals left the search working through the stalest
+                    // scans in the buffer and every lock landed behind the robot.
+                    // Evict the oldest instead.
+                    while (init_feats_down_bodys.size() >= 5)
+                        init_feats_down_bodys.pop();
+                    init_feats_down_bodys.push({init_count, snapshot});
                 }
                 init_count++;
             }
