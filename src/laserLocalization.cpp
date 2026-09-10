@@ -28,11 +28,11 @@
 #include <pcl/registration/icp.h>
 #include <queue>
 
-#include "lio_core.hpp"
+#include "fastlio_core.hpp"
 
 // The estimator core -- globals, sensor callbacks, scan/IMU sync, the
 // ikd-Tree local map, h_share_model, and the cloud/path publishers -- is
-// shared with fastlio_mapping and lives in lio_core.hpp. It used to be
+// shared with fastlio_mapping and lives in fastlio_core.hpp. It used to be
 // duplicated here verbatim; ~1165 lines were byte-identical, so a fix in
 // one node silently did not reach the other.
 //
@@ -707,7 +707,7 @@ public:
         this->declare_parameter<std::string>("publish.tf_child_frame", "base_footprint");
         this->get_parameter("publish.tf_child_frame", tf_child_frame);
         // Point the shared core's logger/clock at this node, so warnings from
-        // lio_core.hpp carry the node name and can be throttled.
+        // fastlio_core.hpp carry the node name and can be throttled.
         lio_logger_ = this->get_logger();
         lio_clock_  = this->get_clock();
         pub_localization_g =

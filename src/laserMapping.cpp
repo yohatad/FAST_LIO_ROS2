@@ -32,11 +32,11 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
-#include "lio_core.hpp"
+#include "fastlio_core.hpp"
 
 // Everything the two nodes share -- estimator globals, callbacks, the
 // ikd-Tree map, h_share_model and the cloud/path publishers -- lives in
-// lio_core.hpp. What remains below is specific to mapping: the odometry
+// fastlio_core.hpp. What remains below is specific to mapping: the odometry
 // publisher (localization has its own, with TF-child and lever-arm twist),
 // the node class, and main().
 
@@ -114,7 +114,7 @@ public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
         // Point the shared core's logger/clock at this node, so warnings from
-        // lio_core.hpp carry the node name and can be throttled.
+        // fastlio_core.hpp carry the node name and can be throttled.
         lio_logger_ = this->get_logger();
         lio_clock_  = this->get_clock();
 

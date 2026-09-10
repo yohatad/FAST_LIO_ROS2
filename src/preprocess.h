@@ -1,6 +1,6 @@
 #pragma once
 // Include guard added: this header defines a class and free functions, and is
-// now reachable twice in one translation unit (directly, and via lio_core.hpp).
+// now reachable twice in one translation unit (directly, and via fastlio_core.hpp).
 // #include <ros/ros.h>
 #include <rclcpp/rclcpp.hpp>
 #include <pcl_conversions/pcl_conversions.h>

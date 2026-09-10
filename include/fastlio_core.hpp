@@ -1,6 +1,6 @@
 #pragma once
 // =============================================================================
-//  lio_core.hpp -- FAST-LIO estimator core, shared by fastlio_mapping and
+//  fastlio_core.hpp -- FAST-LIO estimator core, shared by fastlio_mapping and
 //  fastlio_localization. They were independent copies; ~1165 lines were
 //  byte-identical, so every fix had to be made twice.
 //

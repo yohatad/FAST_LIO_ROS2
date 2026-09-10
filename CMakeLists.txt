@@ -108,7 +108,7 @@ ament_export_dependencies(rosidl_default_runtime)
 add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
 target_include_directories(fastlio_mapping PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  # src/ too: include/lio_core.hpp pulls in IMU_Processing.hpp and preprocess.h,
+  # src/ too: include/fastlio_core.hpp pulls in IMU_Processing.hpp and preprocess.h,
   # which live in src/. They used to resolve relative to the including .cpp.
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
   $<INSTALL_INTERFACE:include>
@@ -143,7 +143,7 @@ add_executable(fastlio_localization
   include/Scancontext/Scancontext.cpp)
 target_include_directories(fastlio_localization PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  # src/ too: include/lio_core.hpp pulls in IMU_Processing.hpp and preprocess.h,
+  # src/ too: include/fastlio_core.hpp pulls in IMU_Processing.hpp and preprocess.h,
   # which live in src/. They used to resolve relative to the including .cpp.
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
   $<INSTALL_INTERFACE:include>
