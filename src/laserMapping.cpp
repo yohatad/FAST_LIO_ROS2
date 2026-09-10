@@ -69,6 +69,7 @@
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
+#define MAP_PUB_MAX_POINTS  (4000000)   // hard cap on the /Laser_map accumulation
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -305,7 +306,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    // Guarded: scan_count is never reset, so at 10 Hz this indexes past the
+    // array after ~20 h of continuous running.
+    if (scan_count < MAXN) s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -347,7 +350,9 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
     
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    // Guarded: scan_count is never reset, so at 10 Hz this indexes past the
+    // array after ~20 h of continuous running.
+    if (scan_count < MAXN) s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -517,9 +522,10 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     }
 
     /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. noted that pcd save will influence the real-time performences **/
-    /*
+    // Re-enabled. This block was commented out, so pcl_wait_save stayed empty
+    // and main()'s `if (pcl_wait_save->size() > 0 && pcd_save_en)` never fired:
+    // pcd_save_en: true produced NO file and NO error. Note this holds the
+    // full-density cloud in RAM for the whole run, as the config warns.
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -546,7 +552,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             scan_wait_num = 0;
         }
     }
-    */
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -597,6 +602,27 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
                             &laserCloudWorld->points[i]);
     }
     *pcl_wait_pub += *laserCloudWorld;
+
+    // Bounded: this used to append every scan and re-serialise the WHOLE
+    // accumulation once a second, growing memory and bandwidth linearly for the
+    // life of the process. Downsampling makes it converge to the size of the
+    // space visited; the cap is a backstop. save_to_pcd() writes this cloud, so
+    // filter_size_map_min also sets the resolution of a service-saved map.
+    {
+        pcl::VoxelGrid<PointType> vg;
+        const float leaf = filter_size_map_min > 0 ? filter_size_map_min : 0.2f;
+        vg.setLeafSize(leaf, leaf, leaf);
+        vg.setInputCloud(pcl_wait_pub);
+        PointCloudXYZI::Ptr reduced(new PointCloudXYZI());
+        vg.filter(*reduced);
+        pcl_wait_pub.swap(reduced);
+        if (pcl_wait_pub->size() > MAP_PUB_MAX_POINTS) {
+            printf("[ mapping ] /Laser_map holds %zu points after downsampling "
+                   "(cap %d); clearing. Raise filter_size_map_min.\n",
+                   pcl_wait_pub->size(), MAP_PUB_MAX_POINTS);
+            pcl_wait_pub->clear();
+        }
+    }
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
@@ -653,17 +679,22 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.twist.twist.linear.y = vel_body[1];
     odomAftMapped.twist.twist.linear.z = vel_body[2];
 
+    // Angular velocity: bias-corrected gyro from the last IMU propagation,
+    // already in the body frame that child_frame_id names. Never populated
+    // before, so this twist reported the robot as permanently not rotating.
+    const V3D w_body = p_imu->get_angvel_last();
+    odomAftMapped.twist.twist.angular.x = w_body[0];
+    odomAftMapped.twist.twist.angular.y = w_body[1];
+    odomAftMapped.twist.twist.angular.z = w_body[2];
+
+    // state_ikfom declares pos FIRST (use-ikfom.hpp), so the filter's tangent
+    // indices are pos 0-2, rot 3-5 -- the same order geometry_msgs uses. The
+    // previous swap (k = i<3 ? i+3 : i-3) therefore published the rotation
+    // block where position belongs and vice versa. Inherited from upstream.
     auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
-    {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
-    }
+    for (int i = 0; i < 6; i++)
+        for (int j = 0; j < 6; j++)
+            odomAftMapped.pose.covariance[i*6 + j] = P(i, j);
     // vel occupies state indices 12-14 (see use-ikfom.hpp / get_f: res(i+12)
     // is vel's derivative) -- this is the world-frame vel covariance, not
     // rotated to match vel_body above, but still a useful relative measure
@@ -1235,10 +1266,13 @@ int main(int argc, char** argv)
     /* 2. pcd save will largely influence the real-time performences **/
     if (pcl_wait_save->size() > 0 && pcd_save_en)
     {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+        // map_file_path when set -- the config documents it as where pcd_save
+        // writes; previously this always went to ROOT_DIR/PCD/scans.pcd instead.
+        string all_points_dir = map_file_path.empty()
+            ? string(string(ROOT_DIR) + "PCD/scans.pcd")
+            : map_file_path;
         pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
+        cout << "map saved to " << all_points_dir << endl;
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
     }
 

@@ -91,6 +91,10 @@ public:
         PC_UNIT_RINGGAP = PC_MAX_RADIUS / double(PC_NUM_RING);
     }
 
+    // How many of the newest entries detectLoopClosureID() refuses to match.
+    // Use 1 for a static prior map (excludes only the live query scan).
+    void set_exclude_recent(int n) { NUM_EXCLUDE_RECENT = n < 1 ? 1 : n; }
+
 
 public:
     // hyper parameters ()
@@ -109,7 +113,12 @@ public:
     double PC_UNIT_RINGGAP = PC_MAX_RADIUS / double(PC_NUM_RING);
 
     // tree
-    const int    NUM_EXCLUDE_RECENT = 50; // simply just keyframe gap, but node position distance-based exclusion is ok. 
+    // Upstream's 50 assumes online SLAM, where the newest keyframes are your own
+    // trail and matching them is useless. Against a STATIC prior map it instead
+    // amputates the last 50 map keyframes -- so a robot starting where the
+    // mapping run ended can never match. set_exclude_recent(1) leaves only the
+    // live query scan itself excluded.
+    int          NUM_EXCLUDE_RECENT = 50;
     int    NUM_CANDIDATES_FROM_TREE = 10; // 10 is enough. (refer the IROS 18 paper)
 
     // loop thres

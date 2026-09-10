@@ -1,52 +1,15 @@
 // FAST-LOCALIZATION for ROS 2 -- localization against a prior map, ported from
 // YWL0720/FAST-LOCALIZATION (ROS 1) onto this workspace's FAST-LIO2.
 //
-// WHY THIS EXISTS, AND HOW IT DIFFERS FROM lio_localization (now removed; it
-// lives on at github.com/yohatad/lio_localization).
+// The prior map is loaded straight into the ikd-Tree that FAST-LIO's iEKF
+// registers against, so every scan is constrained by the map INSIDE the filter
+// at scan rate. There is no map -> odom correction, and so nothing to jump.
 //
-// lio_localization kept FAST-LIO's own map and bolted a SEPARATE ICP node
-// beside it, which registered the scan against a prior .pcd every ~0.5 s and
-// emitted a discrete map -> odom correction. That correction is a step, and the
-// step IS the jump: MEASURED on slam_20260823_aligned, 383 correction attempts,
-// 223 rejected by the innovation gate (58%), 100 forced through by the
-// 3-strike escape hatch. Fitness cannot catch this: inlierFitness is an inlier
-// COUNT at max_corr_dist (1.0 m) while the gate rejected at 0.30 m, so a
-// correction the gate called implausible cost 0.000 fitness (measured: fitness
-// stays 1.000 out to a full 1.0 m of deliberate offset).
-//
-// CORRECTION to an earlier version of this note, which cited "the largest
-// 49.72 m, growing over the run" as evidence that it diverged. That magnitude
-// was mostly a measurement artifact, and the real defect is more instructive.
-// The gate differenced the TRANSLATION COLUMNS of successive map -> odom
-// transforms -- i.e. the ODOM ORIGIN's position in map, not the robot's. Since
-//     t_map_odom = p_map_base - R_corr * p_odom_base,
-// two corrections differing only in yaw differ in that column by roughly
-// |p_odom_base| * dtheta. This run ends 81.1 m from the odom origin, so ~35 deg
-// of yaw reads as ~49 m -- and because the lever arm grows monotonically as the
-// robot drives away from its start, CONSTANT yaw jitter reads as "growing over
-// the run". Worse, the budget it was compared against (odom_drift_rate, a
-// robot-POSITION bound) pinned to its 0.30 m floor, which at 50-80 m out is
-// 0.2-0.34 deg of allowed yaw -- below ICP's own yaw scatter. So late in a run
-// the gate rejected nearly everything regardless of match quality, which is
-// what the 223/383 and the 100 escape-hatch acceptances actually record.
-//
-// The conclusion below is unaffected -- a correction applied outside the filter
-// is a step, and a 35 deg yaw lock is still a wrong lock -- but the reported
-// magnitudes were lever-arm inflated and should not be quoted as pose error.
-//
-// This node removes the correction entirely. The prior map is loaded straight
-// into the ikd-Tree that FAST-LIO's iEKF registers against, so every scan is
-// constrained by the map INSIDE the filter at scan rate. There is no map->odom
-// step to jump, because there is no separate correction.
-//
-// INITIALIZATION is automatic: ScanContext matches the current scan against the
-// map's keyframe descriptors, then two-stage ICP (5 m then 1 m correspondence)
-// refines against that keyframe's cloud. It is required to agree TWICE within
-// init_agree_dist before being accepted -- a single descriptor hit in a
-// corridor is exactly the confident-wrong-lock this workspace keeps hitting.
-//
-// After the lock the map is READ-ONLY: map_incremental stops, so drifting scans
-// cannot contaminate the prior.
+// Initialization is automatic: ScanContext matches the current scan against the
+// map's keyframe descriptors, then two-stage ICP refines against that
+// keyframe's cloud. Candidates must clear an overlap gate and agree twice
+// within init_agree_dist before being accepted. After the lock the map is
+// READ-ONLY: map_incremental stops, so drifting scans cannot contaminate it.
 //
 // MAP FORMAT (built by utils/pgo_to_scancontext_map.py from a PGO run):
 //   <map_dir>/pose.json    one line per keyframe: tx ty tz qw qx qy qz
@@ -105,6 +68,7 @@
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
+#define MAP_PUB_MAX_POINTS  (4000000)   // hard cap on the /Laser_map accumulation
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -160,7 +124,16 @@ PointCloudXYZI::Ptr _featsArray;
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
 
-KD_TREE<PointType> ikdtree;
+// Held by pointer, not by value. KD_TREE owns raw nodes, a pthread created
+// with `this`, and six mutexes; it declares a destructor and no assignment
+// operators, which suppresses its implicit MOVE but leaves the implicit COPY.
+// As values, `ikdtree = std::move(ikdtree_global)` therefore resolved to copy
+// assignment: both objects ended up owning one node graph and freed it twice
+// at static destruction (heap-use-after-free), the pre-lock tree leaked, and
+// 76 MB of Rebuild_Logger was memcpy'd inside the scan callback. shared_ptr
+// move-assign transfers ownership for real and destroys the replaced tree
+// exactly once. The Ptr alias is provided by ikd_Tree.h.
+KD_TREE<PointType>::Ptr ikdtree(new KD_TREE<PointType>());
 
 V3F XAxisPoint_body(LIDAR_SP_LEN, 0.0, 0.0);
 V3F XAxisPoint_world(LIDAR_SP_LEN, 0.0, 0.0);
@@ -172,90 +145,52 @@ M3D Lidar_R_wrt_IMU(Eye3d);
 /*** FAST-LOCALIZATION state ***/
 SCManager scManager;                       // ScanContext descriptor DB of the prior map
 PointCloudXYZI::Ptr global_map(new PointCloudXYZI());
-KD_TREE<PointType> ikdtree_global;         // prior map as an ikd-Tree, swapped in on lock
+KD_TREE<PointType>::Ptr ikdtree_global(new KD_TREE<PointType>());  // prior map as an ikd-Tree, moved into ikdtree on lock
 std::vector<V3D, Eigen::aligned_allocator<V3D>> position_map;   // keyframe positions (map)
 std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_map;
-// Odometry trail during the init phase. The ScanContext match names a SCAN, not
-// "now", so the pose it yields has to be carried forward by the odometry that
-// accumulated since -- hence keeping the whole trail rather than just the latest.
+// Odometry trail during the init phase. A ScanContext match names a SCAN, not
+// "now", so its pose must be carried forward by the odometry accumulated since.
 std::vector<V3D, Eigen::aligned_allocator<V3D>> position_init;
 std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_init;
 std::queue<std::pair<int, PointCloudXYZI::Ptr>> init_feats_down_bodys;
 std::mutex init_feats_mutex, init_state_mutex;
 // Sliding window of accepted init candidates (see global_localization_thread).
-// Global rather than a local in that function so rearm_search() can drop it on
-// /relocalize -- otherwise a stale candidate from before the relocalize could
-// pair with a fresh one and produce a bogus instant "agreement".
+// Global so rearm_search() can drop it on /relocalize.
 std::vector<int> candidate_ids;
 std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> candidate_poses;
 std::mutex candidate_mutex;
 bool  global_localization_finish = false;  // a lock has been found
 bool  global_update = false;               // the current lock has been APPLIED
-// Cleared by on_deactivate() to stop global_localization_thread cleanly on a
-// lifecycle deactivate, distinct from global_localization_finish (which means
-// "found a lock", not "stop running"). Guarded by init_state_mutex, same as
-// global_localization_finish, since both are read together at the top of the
-// thread's outer loop.
+// Cleared by on_deactivate() to stop global_localization_thread. Distinct from
+// global_localization_finish ("found a lock", not "stop running").
 bool  keep_searching = true;
 bool  map_swapped   = false;               // ikdtree already holds the prior map
 std::atomic<bool> relocalize_requested{false};
 // A pose handed in on /initialpose, waiting to be applied by the scan pipeline.
-// Kept separate from init_result because it is applied DIFFERENTLY: a
-// ScanContext lock names a past scan and must be carried forward by the odometry
-// since, whereas a seed means "you are here, NOW" and is applied as-is. Feeding
-// a seed through the carry-forward is wrong once a lock already exists, because
-// the state is then in map while the odometry trail is in the LIO frame --
-// MEASURED, that sent a correctly-localized filter from x=13.09 to x=64.34
-// z=49.80.
+// Applied as-is, unlike a ScanContext lock, which names a past scan and must be
+// carried forward by the odometry since.
 std::mutex seed_mutex;
 Eigen::Matrix4d pending_seed = Eigen::Matrix4d::Identity();
 std::atomic<bool> has_pending_seed{false};
 int   init_count = 0;
 std::pair<int, Eigen::Matrix4d> init_result;
-// The map is TWO things with very different natures, so they are addressed
-// separately. pose.json is 233 KB and IS the map's identity -- it belongs in
-// pepper_navigation beside pepper_map_lc_poses.txt, tracked, where the pairing
-// between the two localization stacks' maps is visible. The 2735 keyframe
-// clouds are 75 MB of binary that would be gitignored anyway, and putting them
-// in a ROS package means install(DIRECTORY) copies all 2735 on every build.
+// pose.json is the map's identity and lives tracked in pepper_navigation; the
+// keyframe clouds are bulk binary and are addressed separately.
 std::string map_dir_param;                 // holds the pose file
 std::string map_pose_file_param;           // pose file; bare name or absolute path
 std::string map_scan_dir_param;            // holds <N>.pcd; defaults to <map_dir>/pcd
 int    init_agree_count = 2;               // independent locks that must agree
 double init_agree_dist  = 2.0;             // metres they must agree within
 double init_icp_coarse  = 5.0, init_icp_fine = 1.0;
-// ScanContext descriptor geometry -- sized to THIS sensor, not upstream's 64-beam
-// car lidar. See the note in Scancontext.h: the L2's downsampled keyframes are
-// ~1600 pts with 90% inside 2.9 m, so a 80 m radius leaves most of the descriptor
-// empty. Radius is set from the data; rings/sectors are reduced so the bins that
-// remain actually hold points (20x60 = 1200 bins for 1600 points is ~1 pt/bin).
+// ScanContext descriptor geometry -- sized to THIS sensor, not upstream's
+// 64-beam car lidar. See the note in Scancontext.h.
 double sc_lidar_height = 0.5, sc_max_radius = 10.0, sc_dist_thres = 0.15;
-// Minimum fraction of the scan that must land on the prior map, at the pose a
-// candidate proposes, for that candidate to be believed at all.
-// TUNED, not guessed. At 1.0 m tolerance a wrong lock 41 m from truth still
-// scored 97-100%: the map is dense (4.5M pts) and the scan sparse (~1600 pts
-// mostly within 3 m), so indoors almost any pose puts most points within a
-// metre of something. That is the same saturation that made the old stack's
-// ICP fitness useless. At 0.20 m the wrong candidates score 50-67% and the
-// right ones 99-100% -- a clean separation.
-// Require the agreeing estimates to come from scans the robot actually MOVED
-// between, and compare them with the odometry between compensated out.
-//
-// Without this, agreement is close to vacuous when starting from a standstill:
-// two "independent" estimates are then taken from near-identical scans, so of
-// course they agree. MEASURED at a stationary start mid-corridor: keyframes
-// 2625 and 2636 -- eleven apart, the same place -- both scored 93-100% overlap
-// and agreed to 0.35 m, and the lock was 40 m from truth.
-//
-// With it, a spurious match has to stay consistent ACROSS the robot moving,
-// which is a much harder thing to be accidentally right about. The cost is that
-// initialization cannot finish while stationary -- arguably correct, since one
-// viewpoint genuinely cannot disambiguate a corridor.
-// Default OFF. It makes an unseeded ScanContext lock far more reliable (see
-// above), but it also means initialization cannot finish until the robot has
-// driven init_motion_min, which is the wrong trade when an operator is going to
-// supply the pose via /initialpose anyway -- a seeded start needs no
-// disambiguation. Turn it ON for unattended startup with no seed.
+// Gates on a candidate lock. init_min_overlap is the fraction of the scan that
+// must land within init_overlap_dist of the prior map; the tolerance is tight
+// because a loose one saturates (at 1.0 m a lock 41 m out still scored ~100%).
+// init_require_motion additionally demands the agreeing estimates come from
+// scans the robot moved between -- two near-identical scans agree trivially.
+// Default OFF: it blocks a stationary start, wrong when /initialpose is used.
 bool   init_require_motion = false;
 double init_motion_min = 0.50;    // metres of odometry between the two scans
 double init_min_overlap = 0.70;
@@ -263,13 +198,9 @@ double init_overlap_dist = 0.20;  // metres; a point nearer than this is "on the
 pcl::KdTreeFLANN<PointType>::Ptr global_map_kdtree;
 int    sc_num_ring = 12, sc_num_sector = 40;
 double prior_map_view_leaf = 0.20;   // display-only downsample for /prior_map
-// TF child frame. FAST-LIO natively broadcasts map -> <body_frame>, which here
-// is camera_imu_optical_frame -- the IMU on the mast. That is the wrong thing to
-// hand a bag or nav2 for two reasons: REP-105 wants map -> base_footprint, and
-// the bag's own /tf_static already publishes base_footprint -> camera_imu_-
-// optical_frame, so broadcasting the IMU edge too would give that frame TWO
-// parents and split the tree. Composing the (static) body -> base extrinsic on
-// first lookup and broadcasting map -> base_footprint keeps one parent each.
+// TF child frame. FAST-LIO natively broadcasts map -> <body_frame> (the IMU),
+// but REP-105 wants map -> base_footprint, and /tf_static already parents the
+// IMU frame -- broadcasting it too would split the tree.
 std::string tf_child_frame;                 // "" => broadcast body_frame as-is
 bool  tf_child_resolved = false;
 M3D   R_body_to_tfchild(Eye3d);
@@ -286,6 +217,43 @@ static rclcpp::Clock::SharedPtr this_clock() {
 }
 std::shared_ptr<tf2_ros::TransformListener> tf_listener_g;
 bool   map_loaded = false;
+
+/*** Resolve the STATIC body -> tf_child extrinsic, once, and cache it.
+ ***
+ *** Called from publish_odometry() and from the /initialpose handler. It used
+ *** to live inside publish_odometry()'s `if (publish_tf_en)` block, which meant
+ *** /initialpose -- which hard-rejects until tf_child_resolved -- was DEAD
+ *** whenever publish_tf was false or tf_child_frame named the body frame. ***/
+bool resolve_tf_child()
+{
+    if (tf_child_resolved) return true;
+    // No distinct child frame: the filter's body frame is already the target.
+    if (tf_child_frame.empty() || tf_child_frame == body_frame) {
+        R_body_to_tfchild = Eye3d;
+        t_body_to_tfchild = V3D(0, 0, 0);
+        tf_child_resolved = true;
+        return true;
+    }
+    if (!tf_buffer_g) return false;
+    try {
+        auto tfs = tf_buffer_g->lookupTransform(
+            body_frame, tf_child_frame, tf2::TimePointZero);
+        const auto &q = tfs.transform.rotation;
+        const auto &v = tfs.transform.translation;
+        Eigen::Quaterniond eq(q.w, q.x, q.y, q.z);
+        R_body_to_tfchild = eq.toRotationMatrix();
+        t_body_to_tfchild = V3D(v.x, v.y, v.z);
+        tf_child_resolved = true;
+        return true;
+    } catch (const tf2::TransformException &ex) {
+        // Throttled, not silent: returning quietly here shows up only as nav2
+        // waiting forever for a map frame.
+        RCLCPP_WARN_THROTTLE(this_logger(), *this_clock(), 5000,
+            "cannot resolve %s -> %s yet (%s)",
+            body_frame.c_str(), tf_child_frame.c_str(), ex.what());
+        return false;
+    }
+}
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
@@ -384,7 +352,7 @@ void RGBpointBodyLidarToIMU(PointType const * const pi, PointType * const po)
 void points_cache_collect()
 {
     PointVector points_history;
-    ikdtree.acquire_removed_points(points_history);
+    ikdtree->acquire_removed_points(points_history);
     // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
 }
 
@@ -434,7 +402,7 @@ void lasermap_fov_segment()
 
     points_cache_collect();
     double delete_begin = omp_get_wtime();
-    if(cub_needrm.size() > 0) kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm);
+    if(cub_needrm.size() > 0) kdtree_delete_counter = ikdtree->Delete_Point_Boxes(cub_needrm);
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
@@ -459,7 +427,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    // Guarded: scan_count is never reset, so at 10 Hz this indexes past the
+    // array after ~20 h of continuous running.
+    if (scan_count < MAXN) s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -501,7 +471,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(last_timestamp_lidar);
     
-    s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
+    if (scan_count < MAXN) s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
@@ -638,8 +608,8 @@ void map_incremental()
     }
 
     double st_time = omp_get_wtime();
-    add_point_size = ikdtree.Add_Points(PointToAdd, true);
-    ikdtree.Add_Points(PointNoNeedDownsample, false); 
+    add_point_size = ikdtree->Add_Points(PointToAdd, true);
+    ikdtree->Add_Points(PointNoNeedDownsample, false); 
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
 }
@@ -752,6 +722,29 @@ void publish_map(rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointClo
     }
     *pcl_wait_pub += *laserCloudWorld;
 
+    // Bounded. This used to append every scan and re-serialise the WHOLE
+    // accumulation once a second, so memory and per-message bandwidth grew
+    // linearly for the life of the process. Voxel-downsampling makes the cloud
+    // converge to the size of the space actually visited; the hard cap is a
+    // backstop for a leaf size small enough that it does not.
+    {
+        pcl::VoxelGrid<PointType> vg;
+        const float leaf = filter_size_map_min > 0 ? filter_size_map_min : 0.2f;
+        vg.setLeafSize(leaf, leaf, leaf);
+        vg.setInputCloud(pcl_wait_pub);
+        PointCloudXYZI::Ptr reduced(new PointCloudXYZI());
+        vg.filter(*reduced);
+        pcl_wait_pub.swap(reduced);
+        if (pcl_wait_pub->size() > MAP_PUB_MAX_POINTS) {
+            RCLCPP_WARN_THROTTLE(this_logger(), *this_clock(), 30000,
+                "/Laser_map holds %zu points after downsampling (cap %d); "
+                "clearing. Raise filter_size_map_min or set publish.map_en false "
+                "-- the prior map is already on /prior_map.",
+                pcl_wait_pub->size(), MAP_PUB_MAX_POINTS);
+            pcl_wait_pub->clear();
+        }
+    }
+
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
@@ -793,42 +786,40 @@ void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::
     set_posestamp(odomAftMapped.pose);
 
     // Linear velocity: state_point.vel is the IKFOM state's own filtered
-    // velocity estimate (get_f() integrates it straight into pos, i.e. it's
-    // expressed in the map/world frame). nav_msgs/Odometry's twist is
-    // conventionally in child_frame_id (body frame, REP 103), so rotate it
-    // by the inverse of the current orientation before publishing.
-    // This is populated so downstream consumers get the EKF's own smoothed
-    // velocity instead of differencing consecutive /Odometry poses
-    // themselves -- differencing amplifies the ~1-2cm scan-matching jitter
-    // into a badly noisy velocity (same effect that inflated raw-rate
-    // "distance traveled" 2x in the travel-distance analysis).
+    // estimate, in the world frame. nav_msgs/Odometry's twist is conventionally
+    // in child_frame_id (REP 103), so rotate it by the inverse orientation.
+    // Published so consumers get the EKF's smoothed velocity rather than
+    // differencing poses, which amplifies scan-matching jitter.
     vect3 vel_body = state_point.rot.conjugate() * state_point.vel;
     odomAftMapped.twist.twist.linear.x = vel_body[0];
     odomAftMapped.twist.twist.linear.y = vel_body[1];
     odomAftMapped.twist.twist.linear.z = vel_body[2];
 
+    // Angular velocity: the bias-corrected gyro from the last IMU propagation,
+    // already in the body frame that child_frame_id names. Never populated
+    // before, which left this twist -- and the lever-arm term in
+    // /localization/pose below, which reads it -- silently and permanently zero.
+    const V3D w_body = p_imu->get_angvel_last();
+    odomAftMapped.twist.twist.angular.x = w_body[0];
+    odomAftMapped.twist.twist.angular.y = w_body[1];
+    odomAftMapped.twist.twist.angular.z = w_body[2];
+
+    // state_ikfom declares pos FIRST (use-ikfom.hpp), so the filter's tangent
+    // indices are pos 0-2, rot 3-5 -- the same order geometry_msgs uses. The
+    // previous swap (k = i<3 ? i+3 : i-3) therefore published the rotation
+    // block where position belongs and vice versa. Inherited from upstream.
     auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
-    {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
-    }
-    // vel occupies state indices 12-14 (see use-ikfom.hpp / get_f: res(i+12)
-    // is vel's derivative) -- this is the world-frame vel covariance, not
-    // rotated to match vel_body above, but still a useful relative measure
-    // of how well-determined the velocity estimate currently is.
+    for (int i = 0; i < 6; i++)
+        for (int j = 0; j < 6; j++)
+            odomAftMapped.pose.covariance[i*6 + j] = P(i, j);
+    // vel occupies state indices 12-14 (see use-ikfom.hpp / get_f). World-frame,
+    // not rotated to match vel_body above.
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
             odomAftMapped.twist.covariance[i*6 + j] = P(12 + i, 12 + j);
 
-    // publish only once every field above is populated -- previously this
-    // call happened before the covariance loop, so every message shipped
-    // the PREVIOUS cycle's covariance instead of its own.
+    // Publish only once every field above is populated, or the message ships
+    // the PREVIOUS cycle's covariance.
     pubOdomAftMapped->publish(odomAftMapped);
 
     if (publish_tf_en)
@@ -837,34 +828,10 @@ void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::
         trans.header.frame_id = map_frame;
         trans.header.stamp = odomAftMapped.header.stamp;
 
-        // Resolve body -> tf_child once. It is a STATIC extrinsic, so a single
-        // successful lookup is cached for the life of the node; until it
-        // succeeds nothing is broadcast, because a map -> base edge computed
-        // from a missing extrinsic would be silently wrong rather than absent.
+        // Nothing is broadcast until the extrinsic resolves -- an edge computed
+        // from a missing one would be silently wrong rather than absent.
         if (!tf_child_frame.empty() && tf_child_frame != body_frame) {
-            if (!tf_child_resolved) {
-                if (!tf_buffer_g) return;
-                try {
-                    auto tfs = tf_buffer_g->lookupTransform(
-                        body_frame, tf_child_frame, tf2::TimePointZero);
-                    const auto &q = tfs.transform.rotation;
-                    const auto &v = tfs.transform.translation;
-                    Eigen::Quaterniond eq(q.w, q.x, q.y, q.z);
-                    R_body_to_tfchild = eq.toRotationMatrix();
-                    t_body_to_tfchild = V3D(v.x, v.y, v.z);
-                    tf_child_resolved = true;
-                } catch (const tf2::TransformException &ex) {
-                    // Throttled, not silent: this used to return quietly and the
-                    // only visible effect was nav2 waiting forever for a map
-                    // frame that was never going to arrive.
-                    RCLCPP_WARN_THROTTLE(this_logger(), *this_clock(), 5000,
-                        "cannot resolve %s -> %s yet (%s); NOT broadcasting "
-                        "%s -> %s until it does",
-                        body_frame.c_str(), tf_child_frame.c_str(), ex.what(),
-                        map_frame.c_str(), tf_child_frame.c_str());
-                    return;
-                }
-            }
+            if (!resolve_tf_child()) return;
             const Eigen::Quaterniond q_mb(odomAftMapped.pose.pose.orientation.w,
                                           odomAftMapped.pose.pose.orientation.x,
                                           odomAftMapped.pose.pose.orientation.y,
@@ -895,13 +862,9 @@ void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::
 
         // /localization/pose -- the SAME pose and twist, but genuinely in
         // tf_child_frame (base_footprint), matching the TF edge just sent.
-        //
-        // /Odometry keeps stock FAST-LIO semantics: child_frame_id is body_frame,
-        // the IMU on the mast, and the twist is in those axes. Anything that
-        // assumes child_frame_id is the robot base -- nav2's odom_topic, for
-        // one -- then reads a velocity rotated by the mount, ~64 deg of yaw on
-        // this rig. lio_localization's transform_fusion documents and fixes the
-        // same thing; this mirrors it so both stacks publish the same contract.
+        // /Odometry keeps stock FAST-LIO semantics (child_frame_id is the IMU),
+        // so anything assuming it is the robot base reads a velocity rotated by
+        // the mount. lio_localization's transform_fusion fixes the same thing.
         if (pub_localization_g && tf_child_resolved) {
             nav_msgs::msg::Odometry loc;
             loc.header = odomAftMapped.header;
@@ -912,9 +875,8 @@ void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::
             loc.pose.pose.orientation = trans.transform.rotation;
             loc.pose.covariance = odomAftMapped.pose.covariance;
 
-            // Twist is expressed in child_frame_id, so rotating alone is not
-            // enough -- the base origin sits off the body origin, so it also
-            // picks up the lever-arm term:
+            // Twist is in child_frame_id, so the base origin's offset from the
+            // body origin adds a lever-arm term:
             //   w_base = R * w_body
             //   v_base = R * v_body + w_base x (R * t)
             // with R = R_base<-body and t = base origin in body coords.
@@ -985,7 +947,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         if (ekfom_data.converge)
         {
             /** Find the closest surfaces in the map **/
-            ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+            ikdtree->Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
             point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
         }
 
@@ -1074,15 +1036,12 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
 
 /*** Load the prior map: per-keyframe clouds + their poses, and build the
- *** ScanContext descriptor DB. Clouds are stored in their OWN frame (that is
- *** what ScanContext needs -- a descriptor of the local structure as seen from
- *** that pose), and transformed into map only when accumulating global_map. ***/
+ *** ScanContext descriptor DB. Clouds are stored in their OWN frame (what
+ *** ScanContext needs), and transformed into map only for global_map. ***/
 bool load_prior_map(const rclcpp::Logger &log)
 {
-    // Named per run, not a bare pose.json: this directory also holds
-    // pepper_map_lc_poses.txt for the other stack, and a second map would drop
-    // a second pose file beside it. An undated name makes those silently
-    // interchangeable -- the same failure as a .pcd paired with the wrong poses.
+    // Named per run, not a bare pose.json: this directory also holds the other
+    // stack's poses, and undated names make them silently interchangeable.
     const std::string pose_path =
         map_pose_file_param.find('/') != std::string::npos
             ? map_pose_file_param
@@ -1120,8 +1079,8 @@ bool load_prior_map(const rclcpp::Logger &log)
 }
 
 /*** Odometry pose at an init-phase scan, as map-agnostic odom <- IMU.
- *** Read under init_feats_mutex: the main thread appends to these vectors while
- *** the search thread reads them, and /relocalize clears them outright. ***/
+ *** Read under init_feats_mutex: the main thread appends while the search
+ *** thread reads, and /relocalize clears these outright. ***/
 bool odom_at(int id, Eigen::Matrix4d &T)
 {
     std::lock_guard<std::mutex> lk(init_feats_mutex);
@@ -1135,16 +1094,10 @@ bool odom_at(int id, Eigen::Matrix4d &T)
 
 /*** Fraction of a scan that lands on the prior map at a proposed pose.
  ***
- *** The agreement check alone is NOT sufficient. MEASURED starting mid-bag in
- *** the corridor: ScanContext matched keyframes 203 and 191, which are adjacent
- *** to each other near the origin, so the two estimates agreed to 1.86 m and
- *** passed a 2 m limit -- while the robot was 41 m away. Two wrong matches to
- *** the same wrong place agree with each other perfectly. Agreement measures
- *** self-consistency, not correctness.
- ***
- *** This asks the map instead: put the scan where the candidate says, and see
- *** how much of it lands on something. A pose 41 m out overlaps almost nothing,
- *** and no amount of internal consistency can fake that. ***/
+ *** The agreement check alone is NOT sufficient: two wrong matches to the same
+ *** wrong place agree with each other perfectly, so agreement measures
+ *** self-consistency, not correctness. This asks the map instead -- put the
+ *** scan where the candidate says and see how much of it lands on something. ***/
 double map_overlap(const PointCloudXYZI::Ptr &scan_body, const Eigen::Matrix4d &T_map_body)
 {
     if (!global_map_kdtree || scan_body->empty()) return 0.0;
@@ -1160,11 +1113,9 @@ double map_overlap(const PointCloudXYZI::Ptr &scan_body, const Eigen::Matrix4d &
 }
 
 /*** Background thread: find where we are, using ScanContext + ICP.
- ***
- *** Runs only until a lock is accepted. It consumes the undistorted scans the
- *** main loop queues during the init phase, and requires init_agree_count
- *** independent locks agreeing within init_agree_dist -- one descriptor hit in a
- *** corridor is not evidence, several that agree are. ***/
+ *** Runs until a lock is accepted, consuming the scans the main loop queues
+ *** during the init phase. Requires init_agree_count independent estimates
+ *** agreeing within init_agree_dist. ***/
 void global_localization_thread(rclcpp::Logger log)
 {
     rclcpp::Rate rate(20);
@@ -1176,12 +1127,11 @@ void global_localization_thread(rclcpp::Logger log)
             already_locked = global_localization_finish;
             keep_going = keep_searching;
         }
-        // on_deactivate() sets this false and joins us -- exit promptly rather
-        // than idle-sleeping through a lifecycle transition that's waiting on us.
+        // on_deactivate() clears this and joins us -- exit promptly rather than
+        // idle-sleeping through a transition that is waiting on us.
         if (!keep_going) return;
-        // Idle, not finished: /relocalize clears this flag to re-arm the search,
-        // so returning here would make relocalization impossible for the life
-        // of the process.
+        // Idle, not finished: /relocalize clears this flag to re-arm the
+        // search, so returning here would make relocalization impossible.
         if (already_locked) { rate.sleep(); continue; }
         if (!map_loaded) { rate.sleep(); continue; }
 
@@ -1189,7 +1139,17 @@ void global_localization_thread(rclcpp::Logger log)
             std::lock_guard<std::mutex> lk(candidate_mutex);
             return (int)candidate_ids.size();
         };
-        while (candidate_count() < init_agree_count && rclcpp::ok())
+        auto still_wanted = []() {
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            return keep_searching;
+        };
+        // keep_searching is checked HERE too, not only in the outer loop. While
+        // searching -- the normal state -- the thread lives in this inner loop,
+        // and on_deactivate() stops the scan timer before joining, so the
+        // candidate count can never advance. Without this check the loop spins
+        // forever (rclcpp::ok() is still true during a lifecycle transition) and
+        // on_deactivate()/on_shutdown() block in join() permanently.
+        while (candidate_count() < init_agree_count && rclcpp::ok() && still_wanted())
         {
             std::pair<int, PointCloudXYZI::Ptr> item;
             {
@@ -1219,8 +1179,8 @@ void global_localization_thread(rclcpp::Logger log)
             const std::string kf_pcd = map_scan_dir_param + "/" + std::to_string(match_id) + ".pcd";
             if (pcl::io::loadPCDFile(kf_pcd, *kf_cloud) < 0) { continue; }
 
-            // Coarse then fine: the coarse pass has to survive a ScanContext hit
-            // that is the right PLACE but metres off; the fine pass is the answer.
+            // Coarse then fine: coarse survives a hit that is the right PLACE
+            // but metres off; fine is the answer.
             Eigen::Matrix4d T_corr = T_sc;
             pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>());
             for (double maxd : {init_icp_coarse, init_icp_fine}) {
@@ -1248,8 +1208,7 @@ void global_localization_thread(rclcpp::Logger log)
             const Eigen::Matrix4d T_cand = T_kf * T_corr * T_i_l.inverse();
 
             // Does the scan actually fit the map there? Checked against the
-            // ORIGINAL scan, not the ICP-transformed copy, and in the lidar
-            // frame the pose describes.
+            // ORIGINAL scan, in the lidar frame the pose describes.
             const Eigen::Matrix4d T_cand_lidar = T_cand * T_i_l;
             const double ov = map_overlap(item.second, T_cand_lidar);
             if (ov < init_min_overlap) {
@@ -1258,8 +1217,8 @@ void global_localization_thread(rclcpp::Logger log)
                             match_id, 100.0 * ov, 100.0 * init_min_overlap);
                 continue;
             }
-            // Motion gate: the new candidate must come from a scan the robot
-            // has actually travelled from, or it is not independent evidence.
+            // Motion gate: the candidate must come from a scan the robot has
+            // actually travelled from, or it is not independent evidence.
             int oldest_id = -1;
             {
                 std::lock_guard<std::mutex> lk(candidate_mutex);
@@ -1296,16 +1255,13 @@ void global_localization_thread(rclcpp::Logger log)
             ids = candidate_ids;
             poses = candidate_poses;
         }
-        // A concurrent /relocalize (or auto-relocalize) can have cleared the
-        // window while the loop above was mid-flight; re-check rather than
-        // trust the count that satisfied the while condition.
+        // A concurrent /relocalize can have cleared the window mid-flight;
+        // re-check rather than trust the count that satisfied the condition.
         if ((int)ids.size() < init_agree_count) continue;
 
-        // Each pose is the map pose at ITS OWN scan, so comparing them raw
-        // penalises a correct pair for the distance the robot covered between
-        // them -- the old 2 m tolerance was quietly absorbing that. Transport
-        // each estimate back to the first scan's instant using the odometry
-        // between, and the comparison becomes a true consistency test:
+        // Each pose is the map pose at ITS OWN scan, so transport each back to
+        // the first scan's instant before comparing, or a correct pair is
+        // penalised for the distance covered between them:
         //     predicted_0 = pose_i * T_odom(id_i)^-1 * T_odom(id_0)
         double spread = 0.0;
         for (size_t i = 1; i < poses.size(); ++i) {
@@ -1344,12 +1300,8 @@ void global_localization_thread(rclcpp::Logger log)
                         init_agree_count, spread, init_agree_dist);
             continue;   // idle until /relocalize re-arms us
         }
-        // Drop only the OLDEST candidate rather than the whole window: a
-        // persistently good match should not be discarded just because it was
-        // paired with one stale/bad one. With init_agree_count == 2 this means
-        // the next new candidate is compared against the one just kept, not a
-        // fresh pair from zero -- so a real, repeatable place is found in one
-        // extra scan instead of requiring two brand-new ones every time.
+        // Drop only the OLDEST candidate, not the whole window: a persistently
+        // good match should survive being paired with one bad one.
         RCLCPP_WARN(log, "[init] rejected: estimates disagree by %.2f m (limit %.2f) "
                          "-- ambiguous place, dropping the oldest and retrying",
                     spread, init_agree_dist);
@@ -1371,21 +1323,16 @@ public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
         : rclcpp_lifecycle::LifecycleNode("fast_lio_localization", options)
     {
-        // Heavy setup happens in on_configure(); resource activation (starting
-        // the scan timer, the init thread, and the lifecycle publishers) in
-        // on_activate(). See the on_cleanup() note below for this node's one
-        // real deviation from the standard lifecycle contract.
+        // Heavy setup in on_configure(); resource activation (timers, init
+        // thread, lifecycle publishers) in on_activate().
     }
 
-    // Supports the standard configure -> activate <-> deactivate cycle
-    // (pause/resume): while inactive, the scan timer does not exist, so no
-    // scan is processed and no publisher emits anything (a LifecyclePublisher
-    // silently no-ops until activated).
+    // Supports the standard configure -> activate <-> deactivate cycle. While
+    // inactive the scan timer does not exist and no publisher emits.
     //
-    // on_cleanup() is DELIBERATELY NOT SUPPORTED (see below): the prior map,
-    // ikd-Trees, and filter state are process-global, not member state, so
-    // there is no safe way to release and reload them in-process. Localizing
-    // against a different map means killing and relaunching the process.
+    // on_cleanup() is DELIBERATELY NOT SUPPORTED: the prior map, ikd-Trees and
+    // filter state are process-global, so there is no safe way to release and
+    // reload them. A different map means relaunching the process.
     CallbackReturn on_configure(const rclcpp_lifecycle::State &) override
     {
         this->declare_parameter<bool>("publish.path_en", true);
@@ -1479,11 +1426,9 @@ public:
         this->get_parameter("localization.init_overlap_dist", init_overlap_dist);
         this->declare_parameter<double>("localization.prior_map_view_leaf", 0.20);
         this->get_parameter("localization.prior_map_view_leaf", prior_map_view_leaf);
-        // Post-lock health check: re-runs map_overlap() periodically against the
-        // LIVE tracked pose (see health_check_callback). A wrong-but-self-
-        // consistent lock produces no other symptom -- effct_feat_num stays
-        // healthy because a self-similar place still looks like a plausible
-        // match -- so nothing else in this node would ever notice one.
+        // Post-lock health check: re-runs map_overlap() against the LIVE tracked
+        // pose (see health_check_callback). A wrong-but-self-consistent lock
+        // produces no other symptom -- effct_feat_num stays healthy.
         this->declare_parameter<double>("localization.health_min_overlap", 0.45);
         this->declare_parameter<double>("localization.health_bad_duration", 5.0);
         this->declare_parameter<double>("localization.health_check_period", 1.0);
@@ -1492,6 +1437,13 @@ public:
         this->get_parameter("localization.health_bad_duration", health_bad_duration_);
         this->get_parameter("localization.health_check_period", health_check_period_);
         this->get_parameter("localization.auto_relocalize", auto_relocalize_);
+        // Covariance the filter is reset to after an /initialpose teleport, in
+        // m^2 and rad^2. Defaults are a loose ~0.7 m / ~11 deg one-sigma, which
+        // is about how well an operator can place a pose in RViz.
+        this->declare_parameter<double>("localization.seed_pos_cov", 0.5);
+        this->declare_parameter<double>("localization.seed_rot_cov", 0.04);
+        this->get_parameter("localization.seed_pos_cov", seed_pos_cov_);
+        this->get_parameter("localization.seed_rot_cov", seed_rot_cov_);
         this->declare_parameter<std::string>("publish.tf_child_frame", "base_footprint");
         this->get_parameter("publish.tf_child_frame", tf_child_frame);
         node_g = this;
@@ -1502,12 +1454,9 @@ public:
         pubDiagnostics_ =
             this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
         tf_buffer_g = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-        // spin_thread=true: the listener gets its OWN thread. Sharing this
-        // node's single-threaded executor does not work -- the scan timer
-        // callback runs the whole iEKF update and blocks it, so /tf_static
-        // callbacks starve and the buffer stays empty however long you wait.
-        // Symptom was a lookup that never resolved, silently, while the frames
-        // were being published the whole time.
+        // spin_thread=true: the listener needs its OWN thread. On this node's
+        // single-threaded executor the scan callback runs the whole iEKF update
+        // and blocks it, so /tf_static starves and the lookup never resolves.
         tf_listener_g = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_g, this, true);
         this->get_parameter_or<double>("cube_side_length",cube_len,200.f);
         this->get_parameter_or<float>("mapping.det_range",DET_RANGE,300.f);
@@ -1591,25 +1540,14 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        // SensorDataQoS (BEST_EFFORT), not a plain depth. A plain depth yields
-        // the DEFAULT profile, i.e. RELIABLE, and a RELIABLE subscriber matches
-        // NOTHING against a BEST_EFFORT publisher -- which is what every real
-        // IMU driver offers, l2lidar_node included. rmw then silently delivers
-        // no IMU at all: FAST-LIO waits forever for IMU init, never emits
-        // /Odometry, and prints no error. The lidar subscription above already
-        // used SensorDataQoS, which is why /points worked while /imu/data did
-        // not, and why this only ever showed up as a broken TF tree
-        // (odom -> base_footprint missing, because lio_odom_bridge had no
-        // odometry to close it with).
-        //
-        // This was masked on bag replay by config/play_qos.yaml, which
-        // re-offers /imu/data as RELIABLE. There is no such override when the
-        // driver is live, so the bug only appeared on the real robot.
-        // BEST_EFFORT readers match BOTH kinds of writer, so this is strictly
-        // more compatible than what it replaces.
-        //
-        // keep_last(200): SensorDataQoS defaults to depth 5, far too shallow
-        // for a 250 Hz IMU feeding a mapping loop that stalls for tens of ms.
+        // SensorDataQoS (BEST_EFFORT), not a plain depth: a plain depth yields
+        // the RELIABLE default, which matches NOTHING against the BEST_EFFORT
+        // publisher every real IMU driver offers. rmw then silently delivers no
+        // IMU at all -- FAST-LIO waits forever for init and prints no error.
+        // Masked on bag replay by config/play_qos.yaml, which re-offers
+        // /imu/data as RELIABLE, so it only appeared on the real robot.
+        // keep_last(200): SensorDataQoS defaults to depth 5, far too shallow for
+        // a 250 Hz IMU feeding a loop that stalls for tens of ms.
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
             imu_topic, rclcpp::SensorDataQoS().keep_last(200), imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
@@ -1621,19 +1559,23 @@ public:
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
-        // Load the prior map and arm the search BEFORE the scan pipeline starts,
-        // so no scan is processed against an empty map. A missing or unreadable
-        // map is fatal here: this node localizes, it has nothing to do without one.
+        // Load the prior map and arm the search BEFORE the scan pipeline starts.
+        // A missing map is fatal: this node has nothing to do without one.
         if (map_dir_param.empty()) {
             RCLCPP_FATAL(this->get_logger(),
                 "localization.map_dir is required -- point it at a directory "
                 "holding pose.json and pcd/.");
             return CallbackReturn::FAILURE;
         }
-        // Before load_prior_map: the map DB and the live scans must be described
-        // with identical geometry or the descriptors are not comparable at all.
+        // Before load_prior_map: the map DB and the live scans must share the
+        // same descriptor geometry or they are not comparable at all.
         scManager.set_geometry(sc_lidar_height, sc_max_radius,
                                sc_num_ring, sc_num_sector, sc_dist_thres);
+        // The DB is a static prior map plus one live query scan, so exclude only
+        // that query. Upstream's 50 is for online SLAM and here would make the
+        // last 50 map keyframes permanently unmatchable -- silently fatal if the
+        // robot starts where the mapping run ended.
+        scManager.set_exclude_recent(1);
         RCLCPP_INFO(this->get_logger(),
             "ScanContext: %d rings x %d sectors over %.1f m, lidar height %.2f m, "
             "dist thresh %.2f", sc_num_ring, sc_num_sector, sc_max_radius,
@@ -1648,18 +1590,17 @@ public:
         }
         global_map_kdtree.reset(new pcl::KdTreeFLANN<PointType>());
         global_map_kdtree->setInputCloud(global_map);
-        ikdtree_global.set_downsample_param(filter_size_map_min);
-        ikdtree_global.Build(global_map->points);
+        ikdtree_global->set_downsample_param(filter_size_map_min);
+        ikdtree_global->Build(global_map->points);
         map_loaded = true;
         RCLCPP_INFO(this->get_logger(),
             "Prior map ready (%zu pts). Searching for initial pose: ScanContext + "
             "ICP, %d estimates must agree within %.2f m.",
             global_map->size(), init_agree_count, init_agree_dist);
-        // Prior map display cloud, LATCHED (transient local) so RViz shows it on
-        // connect. Downsampled for display only -- the ikd-Tree keeps the full
-        // cloud. Built once here and cached; actually published from
-        // on_activate() since a LifecyclePublisher silently drops publish()
-        // calls made before it's activated.
+        // Prior map display cloud, LATCHED so RViz shows it on connect.
+        // Downsampled for display only; the ikd-Tree keeps the full cloud.
+        // Published from on_activate() -- a LifecyclePublisher drops publish()
+        // calls made before activation.
         {
             rclcpp::QoS qos(1);
             qos.transient_local().reliable();
@@ -1679,16 +1620,11 @@ public:
         // /relocalize -- "I do not trust where I think I am". Re-arms the
         // ScanContext search from scratch.
         //
-        // The prior map STAYS in the ikd-Tree while searching. That is
-        // deliberate: the search thread does not use the ikd-Tree (it works off
-        // global_map_kdtree and the per-keyframe clouds), and swapping a local
-        // map back in would mean destroying and rebuilding a 4.5M-point tree on
-        // a service call. While lost the filter simply finds no correspondences
-        // and coasts on IMU, which is what being lost IS.
-        //
-        // Coasting does not corrupt the answer either: the new lock is applied
-        // as T_map_at_lock * T_odom_at_lock^-1 * T_odom_now, all relative, so
-        // however wrong the pose is when the fix arrives, it cancels.
+        // The prior map STAYS in the ikd-Tree while searching: the search thread
+        // does not use it, and rebuilding a 4.5M-point tree on a service call is
+        // not worth it. While lost the filter finds no correspondences and
+        // coasts on IMU. That does not corrupt the answer -- the new lock is
+        // applied relative to the odometry at lock, so the error cancels.
         srv_relocalize_ = this->create_service<std_srvs::srv::Trigger>(
             "/relocalize",
             [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
@@ -1706,16 +1642,12 @@ public:
                 res->message = "Global search re-armed; watch the log for [init].";
             });
 
-        // /initialpose -- seeded initialization, as an alternative to the
-        // ScanContext search rather than a replacement for it. The search keeps
-        // running until something locks; whichever arrives first wins.
-        //
-        // The pose is map <- base_footprint (that is what RViz's 2D Pose
-        // Estimate publishes), while the filter state is map <- body, so the
-        // static body->base extrinsic is composed out. It is applied through the
-        // SAME path as a ScanContext lock -- init_result plus the teleport in
-        // the scan pipeline -- so gravity and velocity are rotated correctly and
-        // the prior map is swapped in exactly once.
+        // /initialpose -- seeded initialization, an alternative to the ScanContext
+        // search rather than a replacement; whichever locks first wins.
+        // RViz publishes map <- base_footprint while the filter state is
+        // map <- body, so the static extrinsic is composed out. Applied through
+        // the SAME path as a lock, so gravity and velocity are rotated correctly
+        // and the prior map is swapped in exactly once.
         sub_initialpose_ = this->create_subscription<
             geometry_msgs::msg::PoseWithCovarianceStamped>(
             "/initialpose", 1,
@@ -1725,7 +1657,7 @@ public:
                         "/initialpose ignored: prior map not loaded yet");
                     return;
                 }
-                if (!tf_child_resolved) {
+                if (!resolve_tf_child()) {
                     RCLCPP_WARN(this->get_logger(),
                         "/initialpose ignored: %s -> %s extrinsic not resolved yet, "
                         "so the pose cannot be converted to the filter's body frame",
@@ -1770,11 +1702,9 @@ public:
         return CallbackReturn::SUCCESS;
     }
 
-    // Starts the pieces that make this node DO something: the scan-rate timer
-    // (so the iEKF loop runs at all), the periodic map/health timers, the
-    // background init-search thread, and the lifecycle publishers (inactive
-    // publishers silently drop everything, so activating them is what makes
-    // publish() calls elsewhere in this file actually emit anything).
+    // Starts the timers (scan-rate, map, health), the background init-search
+    // thread, and the lifecycle publishers -- inactive publishers drop
+    // everything, so activating them is what makes publish() calls emit.
     CallbackReturn on_activate(const rclcpp_lifecycle::State &) override
     {
         pubLaserCloudFull_->on_activate();
@@ -1812,12 +1742,10 @@ public:
         return CallbackReturn::SUCCESS;
     }
 
-    // Inverse of on_activate(): stops the timers (so the iEKF loop and the
-    // periodic checks stop doing work), signals and joins the search thread,
-    // and deactivates the publishers. Lidar/IMU subscriptions and the
-    // /relocalize, /initialpose, map_save entry points stay alive -- they're
-    // harmless while inactive and this avoids re-subscribing on every
-    // activate/deactivate cycle.
+    // Inverse of on_activate(): stops the timers, signals and joins the search
+    // thread, and deactivates the publishers. Subscriptions and the service
+    // entry points stay alive -- harmless while inactive, and this avoids
+    // re-subscribing on every cycle.
     CallbackReturn on_deactivate(const rclcpp_lifecycle::State &) override
     {
         timer_.reset();
@@ -1825,13 +1753,10 @@ public:
         health_timer_.reset();
 
         {
-            // NOT global_localization_finish = true here: the thread's outer
-            // loop checks keep_searching before it checks already_locked, so
-            // clearing keep_searching alone is enough to make it exit within
-            // one 20 Hz tick. Forcing a "locked" state that was never actually
-            // reached would leave init_result holding garbage, and the next
-            // on_activate()'s timer_callback would hand the filter that
-            // garbage pose on its very first tick.
+            // NOT global_localization_finish = true here: the thread checks
+            // keep_searching first, so clearing it alone makes the thread exit
+            // within one tick. Forcing a "locked" state never actually reached
+            // would leave init_result holding garbage for the next activate.
             std::lock_guard<std::mutex> lk(init_state_mutex);
             keep_searching = false;
         }
@@ -1853,12 +1778,10 @@ public:
     }
 
     // NOT SUPPORTED -- see the class-level comment above on_configure(). The
-    // prior map, both ikd-Trees, and the filter state are process-global,
-    // shared with free functions this file inherits from upstream FAST-LIO
-    // (standard_pcl_cbk, imu_cbk, h_share_model, global_localization_thread,
-    // ...), so there is no member-scoped state to release here that would
-    // make a subsequent on_configure() safe to call again. Refusing is safer
-    // than silently reconfiguring onto stale globals.
+    // prior map, both ikd-Trees and the filter state are process-global, shared
+    // with free functions inherited from upstream FAST-LIO, so there is no
+    // member-scoped state to release that would make a second on_configure()
+    // safe. Refusing beats silently reconfiguring onto stale globals.
     CallbackReturn on_cleanup(const rclcpp_lifecycle::State &) override
     {
         RCLCPP_ERROR(this->get_logger(),
@@ -1881,8 +1804,7 @@ public:
     {
         {   // see on_deactivate() for why this doesn't also force
             // global_localization_finish -- harmless here since the process
-            // exits right after, but kept the same way to avoid this pattern
-            // getting copied somewhere it would matter.
+            // exits right after, but kept consistent.
             std::lock_guard<std::mutex> lk(init_state_mutex);
             keep_searching = false;
         }
@@ -1920,13 +1842,13 @@ private:
             // THE HANDOVER. A lock has been found but not yet applied: move the
             // filter state into map coordinates and give it the prior map to
             // register against. From here the estimate IS the map pose -- there
-            // is no map -> odom correction, which is the whole point of this node.
+            // is no map -> odom correction, which is the point of this node.
             //
-            // The lock names the scan it was computed from, and odometry has run
-            // on since, so carry it forward:
+            // The lock names the scan it came from and odometry has run on
+            // since, so carry it forward:
             //   T_map_now = T_map_at_lock * T_odom_at_lock^-1 * T_odom_now
-            // A seed takes precedence and is applied directly: no odometry
-            // carry-forward, so it is correct whether or not a lock exists.
+            // A seed takes precedence and is applied directly, with no
+            // carry-forward, so it is correct with or without an existing lock.
             if (has_pending_seed.exchange(false))
             {
                 Eigen::Matrix4d T_map_now;
@@ -1943,6 +1865,17 @@ private:
                 gs.vel  = R_delta * state_point.vel;
                 gs.grav = S2(V3D(R_delta * state_point.grav.vec));
                 kf.change_x(gs);
+                // An operator's RViz click is easily a metre and several degrees
+                // off, but change_x() alone leaves P at the pre-jump track's
+                // confidence -- so the filter resists the map correcting the
+                // seed. Reset pos (0-2) and rot (3-5) to the seed's own
+                // uncertainty and let the next few scans pull it in.
+                {
+                    auto P = kf.get_P();
+                    P.block<3, 3>(0, 0) = M3D::Identity() * seed_pos_cov_;
+                    P.block<3, 3>(3, 3) = M3D::Identity() * seed_rot_cov_;
+                    kf.change_P(P);
+                }
                 state_point = kf.get_x();
                 if (!map_swapped) {
                     ikdtree = std::move(ikdtree_global);
@@ -1973,20 +1906,14 @@ private:
                         init_result.second * T_odom_lock.inverse() * T_odom_now;
 
                     // The handover is a change of WORLD FRAME, not just a pose
-                    // edit, so every world-frame quantity in the state has to
-                    // rotate with it -- not only pos/rot.
+                    // edit, so every world-frame quantity has to rotate with it
+                    // -- not only pos/rot.
                     //
-                    // Upstream sets pos and rot alone. That is only safe when the
-                    // map frame and the LIO start frame nearly coincide, which is
-                    // true upstream and FALSE here: this map is levelled (the
-                    // map <- pgo_init transform is ~90 deg off the LIO start
-                    // attitude). Leaving grav behind therefore leaves gravity
-                    // pointing sideways in the new frame, the IMU prediction is
-                    // then wrong by ~1 g in the horizontal plane, and the filter
-                    // diverges within a few scans. MEASURED before this fix: the
-                    // first scans matched the prior map exactly (nearest
-                    // neighbour distance 0.000), then z climbed to 96 m and every
-                    // scan reported "No Effective Points".
+                    // Upstream sets pos and rot alone, which is only safe when
+                    // the map and LIO start frames nearly coincide. This map is
+                    // levelled ~90 deg off the LIO start attitude, so leaving
+                    // grav behind points gravity sideways in the new frame and
+                    // the filter diverges within a few scans.
                     const M3D R_old = state_point.rot.toRotationMatrix();
                     const M3D R_new = T_map_now.block<3,3>(0,0);
                     const M3D R_delta = R_new * R_old.transpose();
@@ -1997,15 +1924,12 @@ private:
                     gs.vel  = R_delta * state_point.vel;      // world-frame velocity
                     gs.grav = S2(V3D(R_delta * state_point.grav.vec));
                     // bg/ba are body-frame biases and offset_R/T_L_I is the
-                    // lidar-IMU extrinsic; none of those are world-frame, so they
-                    // carry over untouched.
+                    // lidar-IMU extrinsic; none are world-frame.
                     kf.change_x(gs);
                     state_point = kf.get_x();
 
                     // Hand the filter the prior map -- but only the FIRST time.
-                    // ikdtree_global is moved-from afterwards, and on a
-                    // /relocalize the tree already holds the prior map, so a
-                    // second swap would install an empty tree.
+                    // ikdtree_global is moved-from afterwards.
                     if (!map_swapped) {
                         ikdtree = std::move(ikdtree_global);
                         map_swapped = true;
@@ -2029,7 +1953,12 @@ private:
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
             /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+            // Only while the tree holds a live map. Against the prior map this
+            // deletes points permanently (map_incremental no longer runs to
+            // re-add them), so revisiting a trimmed area would find no map
+            // there. Latent at the shipped cube_side_length, not at a smaller
+            // one -- so guarded rather than relied upon.
+            if (!map_swapped) lasermap_fov_segment();
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -2037,23 +1966,23 @@ private:
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
-            if(ikdtree.Root_Node == nullptr)
+            if(ikdtree->Root_Node == nullptr)
             {
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
                 {
-                    ikdtree.set_downsample_param(filter_size_map_min);
+                    ikdtree->set_downsample_param(filter_size_map_min);
                     feats_down_world->resize(feats_down_size);
                     for(int i = 0; i < feats_down_size; i++)
                     {
                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                     }
-                    ikdtree.Build(feats_down_world->points);
+                    ikdtree->Build(feats_down_world->points);
                 }
                 return;
             }
-            int featsFromMapNum = ikdtree.validnum();
-            kdtree_size_st = ikdtree.size();
+            int featsFromMapNum = ikdtree->validnum();
+            kdtree_size_st = ikdtree->size();
             
             // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
@@ -2073,10 +2002,10 @@ private:
 
             if(0) // If you need to see map point, change to "if(1)"
             {
-                PointVector ().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+                PointVector ().swap(ikdtree->PCL_Storage);
+                ikdtree->flatten(ikdtree->Root_Node, ikdtree->PCL_Storage, NOT_RECORD);
                 featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
+                featsFromMap->points = ikdtree->PCL_Storage;
             }
 
             pointSearchInd_surf.resize(feats_down_size);
@@ -2105,35 +2034,33 @@ private:
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            // Only while still searching. After the lock the prior map is
-            // READ-ONLY: adding live scans would let drift contaminate the very
-            // thing being localized against.
-            if (!global_update) {
+            // Gated on map_swapped, NOT global_update. rearm_search() clears
+            // global_update, so gating on it re-opened the prior map for writing
+            // for the whole duration of a /relocalize or auto-relocalize --
+            // merging in exactly the scans whose pose was just declared
+            // untrustworthy. Once the prior map is in the tree it stays
+            // read-only for the life of the process.
+            if (!map_swapped) {
                 map_incremental();
             }
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
             // Feed the init thread while still searching: the undistorted,
-            // downsampled scan for ScanContext, and the odometry pose it was
-            // taken at, so a lock found several scans later can be carried
-            // forward to now. Indices into position_init/pose_init ARE the id
-            // queued alongside the cloud, so the two cannot drift apart.
+            // downsampled scan plus the odometry pose it was taken at, so a lock
+            // found several scans later can be carried forward to now.
             if (!global_localization_finish)
             {
                 PointCloudXYZI::Ptr snapshot(new PointCloudXYZI());
                 pcl::copyPointCloud(*feats_down_body, *snapshot);
                 {
-                    // The trail and the queue are ONE unit: the id queued
-                    // alongside a scan indexes into these vectors, so appending
-                    // outside the lock let the search thread (and /relocalize's
-                    // clear) race against the append.
-                    std::lock_guard<std::mutex> lk(init_feats_mutex);
+                    // The trail and the queue are ONE unit: the id queued with a
+                    // scan indexes into these vectors, so appending outside the
+                    // lock would race the search thread and /relocalize's clear.
                     position_init.push_back(state_point.pos);
                     pose_init.push_back(state_point.rot);
                     // Bounded: ScanContext + two ICP passes is slower than the
-                    // scan rate, so an unbounded queue would grow without limit
-                    // and the thread would work on ever-staler scans.
+                    // scan rate, so an unbounded queue would only grow staler.
                     if (init_feats_down_bodys.size() < 5)
                         init_feats_down_bodys.push({init_count, snapshot});
                 }
@@ -2150,7 +2077,7 @@ private:
             if (runtime_pos_log)
             {
                 frame_num ++;
-                kdtree_size_end = ikdtree.size();
+                kdtree_size_end = ikdtree->size();
                 aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t5 - t0) / frame_num;
                 aver_time_icp = aver_time_icp * (frame_num - 1)/frame_num + (t_update_end - t_update_start) / frame_num;
                 aver_time_match = aver_time_match * (frame_num - 1)/frame_num + (match_time)/frame_num;
@@ -2198,7 +2125,7 @@ private:
         }
         {
             // Otherwise a candidate accepted before this rearm could pair with
-            // a fresh one after it and produce a bogus instant "agreement".
+            // a fresh one and produce a bogus instant "agreement".
             std::lock_guard<std::mutex> lk(candidate_mutex);
             candidate_ids.clear();
             candidate_poses.clear();
@@ -2211,23 +2138,15 @@ private:
     }
 
     // Runs at health_check_period_ Hz, only once locked. Re-scores the CURRENT
-    // tracked pose against the prior map with the same map_overlap() used
-    // during init, and publishes it on /localization/overlap so an operator (or
-    // a watchdog) has a continuous confidence signal instead of only the
-    // one-shot "Localized" log line.
+    // tracked pose with the same map_overlap() used during init and publishes
+    // it on /localization/overlap, giving a continuous confidence signal.
     //
-    // A single low reading is expected and not acted on -- turning a corner
-    // into an unmapped side room, a person crossing the scan, or driving past
-    // the map's edge all dip overlap for a scan or two on a CORRECT lock, and
-    // reacting to that would spuriously re-trigger the search during normal
-    // operation. Only overlap that stays below health_min_overlap_ for the
-    // full health_bad_duration_ window -- meaning the robot moved and looked
-    // at several different things and still isn't matching the map anywhere --
-    // is treated as evidence of an actual wrong lock.
-    // Publishes one DiagnosticArray with a single "fastlio_localization: pose
-    // lock" status, so rqt_robot_monitor (or any diagnostic_updater consumer)
-    // shows this node continuously -- not just via log lines an operator has
-    // to be watching at the right moment.
+    // A single low reading is NOT acted on -- an unmapped side room, a person
+    // crossing the scan, or the map's edge all dip overlap briefly on a correct
+    // lock. Only overlap below health_min_overlap_ for the full
+    // health_bad_duration_ window is treated as a wrong lock.
+    // Also published as a DiagnosticArray so rqt_robot_monitor shows this node
+    // continuously, not just via log lines.
     void publish_diagnostic(uint8_t level, const std::string &message,
                              const std::string &overlap_value = "")
     {
@@ -2355,6 +2274,8 @@ private:
     double health_check_period_  = 1.0;
     bool   auto_relocalize_      = true;
     bool   overlap_bad_          = false;
+    double seed_pos_cov_         = 0.5;
+    double seed_rot_cov_         = 0.04;
     double last_overlap_         = 1.0;
     rclcpp::Time bad_since_;
 
