@@ -15,6 +15,7 @@
 //   <map_dir>/pose.json    one line per keyframe: tx ty tz qw qx qy qz
 //   <map_dir>/pcd/<N>.pcd  that keyframe's cloud, in ITS OWN frame
 //
+#include <unordered_map>
 #include <atomic>
 #include <std_msgs/msg/float32.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
@@ -55,7 +56,7 @@ using PoseVec = std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Mat
 SCManager                        scManager;             // ScanContext descriptor DB of the map
 PointCloudXYZI::Ptr              global_map(new PointCloudXYZI());  // all keyframes, in map frame
 pcl::KdTreeFLANN<PointType>::Ptr global_map_kdtree;      // over global_map; backs map_overlap()
-KD_TREE<PointType>::Ptr          ikdtree_global(new KD_TREE<PointType>());  // moved into ikdtree on lock
+KD_TREE<PointType>::Ptr          ikdtree_global(new KD_TREE<PointType>());  // shared into ikdtree on lock; kept for re-locks
 PosVec                           position_map;          // keyframe positions, map frame
 QuatVec                          pose_map;              // keyframe orientations, map frame
 bool                             map_loaded = false;    // prior map is in memory and usable
@@ -84,8 +85,7 @@ std::pair<int, Eigen::Matrix4d> init_result;            // {trail id, map <- IMU
 
 /* --- handover state --- scan-timer thread only --- */
 bool global_update = false;                             // the current lock has been APPLIED
-bool map_swapped   = false;                             // ikdtree holds the prior map; never reset
-std::atomic<bool> relocalize_requested{false};          // /relocalize asked for a re-arm
+bool map_swapped   = false;                             // ikdtree currently IS the prior map; a re-arm clears it
 
 /* --- /initialpose seed --- guarded by seed_mutex ---
    Applied as-is, unlike a ScanContext lock, which names a past scan. */
@@ -216,80 +216,88 @@ void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::
     // the PREVIOUS cycle's covariance.
     pubOdomAftMapped->publish(odomAftMapped);
 
-    if (publish_tf_en)
-    {
-        geometry_msgs::msg::TransformStamped trans;
-        trans.header.frame_id = map_frame;
-        trans.header.stamp = odomAftMapped.header.stamp;
+    // Everything below claims the pose is IN THE MAP, so it waits for an
+    // applied lock. Before the handover -- and again after a re-arm -- the
+    // filter is in its own odometry frame, anchored wherever the run started.
+    // Broadcasting that as map -> base_footprint drew the robot at the map
+    // origin, driving through walls until the lock snapped it into place, and
+    // handed nav2 a pose the health check had just declared wrong.
+    if (!global_update) return;
 
-        // Nothing is broadcast until the extrinsic resolves -- an edge computed
-        // from a missing one would be silently wrong rather than absent.
-        if (!tf_child_frame.empty() && tf_child_frame != body_frame) {
-            if (!resolve_tf_child()) return;
-            const Eigen::Quaterniond q_mb(odomAftMapped.pose.pose.orientation.w,
-                                          odomAftMapped.pose.pose.orientation.x,
-                                          odomAftMapped.pose.pose.orientation.y,
-                                          odomAftMapped.pose.pose.orientation.z);
-            const M3D R_mb = q_mb.toRotationMatrix();
-            const V3D p_mb(odomAftMapped.pose.pose.position.x,
-                           odomAftMapped.pose.pose.position.y,
-                           odomAftMapped.pose.pose.position.z);
-            const M3D R_mc = R_mb * R_body_to_tfchild;
-            const V3D p_mc = R_mb * t_body_to_tfchild + p_mb;
-            const Eigen::Quaterniond q_mc(R_mc);
-            trans.child_frame_id = tf_child_frame;
-            trans.transform.translation.x = p_mc(0);
-            trans.transform.translation.y = p_mc(1);
-            trans.transform.translation.z = p_mc(2);
-            trans.transform.rotation.w = q_mc.w();
-            trans.transform.rotation.x = q_mc.x();
-            trans.transform.rotation.y = q_mc.y();
-            trans.transform.rotation.z = q_mc.z();
-        } else {
-            trans.child_frame_id = body_frame;
-            trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-            trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-            trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-            trans.transform.rotation = odomAftMapped.pose.pose.orientation;
-        }
-        tf_br->sendTransform(trans);
+    // Resolved once and cached. Nothing map-frame goes out until it resolves:
+    // an edge composed from a missing extrinsic would be silently wrong.
+    if (!resolve_tf_child()) return;
 
-        // /localization/pose -- the SAME pose and twist, but genuinely in
-        // tf_child_frame (base_footprint), matching the TF edge just sent.
-        // /Odometry keeps stock FAST-LIO semantics (child_frame_id is the IMU),
-        // so anything assuming it is the robot base reads a velocity rotated by
-        // the mount. lio_localization's transform_fusion fixes the same thing.
-        if (pub_localization_g && tf_child_resolved) {
-            nav_msgs::msg::Odometry loc;
-            loc.header = odomAftMapped.header;
-            loc.child_frame_id = tf_child_frame;
-            loc.pose.pose.position.x = trans.transform.translation.x;
-            loc.pose.pose.position.y = trans.transform.translation.y;
-            loc.pose.pose.position.z = trans.transform.translation.z;
-            loc.pose.pose.orientation = trans.transform.rotation;
-            loc.pose.covariance = odomAftMapped.pose.covariance;
+    geometry_msgs::msg::TransformStamped trans;
+    trans.header.frame_id = map_frame;
+    trans.header.stamp = odomAftMapped.header.stamp;
+    if (!tf_child_frame.empty() && tf_child_frame != body_frame) {
+        const Eigen::Quaterniond q_mb(odomAftMapped.pose.pose.orientation.w,
+                                      odomAftMapped.pose.pose.orientation.x,
+                                      odomAftMapped.pose.pose.orientation.y,
+                                      odomAftMapped.pose.pose.orientation.z);
+        const M3D R_mb = q_mb.toRotationMatrix();
+        const V3D p_mb(odomAftMapped.pose.pose.position.x,
+                       odomAftMapped.pose.pose.position.y,
+                       odomAftMapped.pose.pose.position.z);
+        const M3D R_mc = R_mb * R_body_to_tfchild;
+        const V3D p_mc = R_mb * t_body_to_tfchild + p_mb;
+        const Eigen::Quaterniond q_mc(R_mc);
+        trans.child_frame_id = tf_child_frame;
+        trans.transform.translation.x = p_mc(0);
+        trans.transform.translation.y = p_mc(1);
+        trans.transform.translation.z = p_mc(2);
+        trans.transform.rotation.w = q_mc.w();
+        trans.transform.rotation.x = q_mc.x();
+        trans.transform.rotation.y = q_mc.y();
+        trans.transform.rotation.z = q_mc.z();
+    } else {
+        trans.child_frame_id = body_frame;
+        trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
+        trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
+        trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
+        trans.transform.rotation = odomAftMapped.pose.pose.orientation;
+    }
 
-            // Twist is in child_frame_id, so the base origin's offset from the
-            // body origin adds a lever-arm term:
-            //   w_base = R * w_body
-            //   v_base = R * v_body + w_base x (R * t)
-            // with R = R_base<-body and t = base origin in body coords.
-            const M3D R_bb = R_body_to_tfchild.transpose();
-            const V3D r_b  = R_bb * t_body_to_tfchild;
-            const auto &tw = odomAftMapped.twist.twist;
-            const V3D v_b_in(tw.linear.x, tw.linear.y, tw.linear.z);
-            const V3D w_b_in(tw.angular.x, tw.angular.y, tw.angular.z);
-            const V3D w_o = R_bb * w_b_in;
-            const V3D v_o = R_bb * v_b_in + w_o.cross(r_b);
-            loc.twist.twist.linear.x = v_o(0);
-            loc.twist.twist.linear.y = v_o(1);
-            loc.twist.twist.linear.z = v_o(2);
-            loc.twist.twist.angular.x = w_o(0);
-            loc.twist.twist.angular.y = w_o(1);
-            loc.twist.twist.angular.z = w_o(2);
-            loc.twist.covariance = odomAftMapped.twist.covariance;
-            pub_localization_g->publish(loc);
-        }
+    // publish_tf governs the TF broadcast only. /localization/pose used to sit
+    // inside the same block, so publish_tf:=false silently removed the topic
+    // bt_navigator takes its odometry from.
+    if (publish_tf_en) tf_br->sendTransform(trans);
+
+    // /localization/pose -- the SAME pose and twist, but genuinely in
+    // tf_child_frame (base_footprint), matching the TF edge above.
+    // /Odometry keeps stock FAST-LIO semantics (child_frame_id is the IMU),
+    // so anything assuming it is the robot base reads a velocity rotated by
+    // the mount. lio_localization's transform_fusion fixes the same thing.
+    if (pub_localization_g) {
+        nav_msgs::msg::Odometry loc;
+        loc.header = odomAftMapped.header;
+        loc.child_frame_id = trans.child_frame_id;
+        loc.pose.pose.position.x = trans.transform.translation.x;
+        loc.pose.pose.position.y = trans.transform.translation.y;
+        loc.pose.pose.position.z = trans.transform.translation.z;
+        loc.pose.pose.orientation = trans.transform.rotation;
+        loc.pose.covariance = odomAftMapped.pose.covariance;
+        // Twist is in child_frame_id, so the base origin's offset from the
+        // body origin adds a lever-arm term:
+        //   w_base = R * w_body
+        //   v_base = R * v_body + w_base x (R * t)
+        // with R = R_base<-body and t = base origin in body coords.
+        const M3D R_bb = R_body_to_tfchild.transpose();
+        const V3D r_b  = R_bb * t_body_to_tfchild;
+        const auto &tw = odomAftMapped.twist.twist;
+        const V3D v_b_in(tw.linear.x, tw.linear.y, tw.linear.z);
+        const V3D w_b_in(tw.angular.x, tw.angular.y, tw.angular.z);
+        const V3D w_o = R_bb * w_b_in;
+        const V3D v_o = R_bb * v_b_in + w_o.cross(r_b);
+        loc.twist.twist.linear.x = v_o(0);
+        loc.twist.twist.linear.y = v_o(1);
+        loc.twist.twist.linear.z = v_o(2);
+        loc.twist.twist.angular.x = w_o(0);
+        loc.twist.twist.angular.y = w_o(1);
+        loc.twist.twist.angular.z = w_o(2);
+        loc.twist.covariance = odomAftMapped.twist.covariance;
+        pub_localization_g->publish(loc);
     }
 }
 
@@ -399,9 +407,13 @@ void global_localization_thread(rclcpp::Logger log)
             std::lock_guard<std::mutex> lk(candidate_mutex);
             return (int)candidate_ids.size();
         };
+        // Also false once a lock exists: /initialpose sets
+        // global_localization_finish from outside, and without this the thread
+        // stayed in the inner loop working through queued scans and could
+        // still announce an "[init] LOCKED" nothing would ever apply.
         auto still_wanted = []() {
             std::lock_guard<std::mutex> lk(init_state_mutex);
-            return keep_searching;
+            return keep_searching && !global_localization_finish;
         };
         // keep_searching is checked HERE too, not only in the outer loop. While
         // searching -- the normal state -- the thread lives in this inner loop,
@@ -435,9 +447,23 @@ void global_localization_thread(rclcpp::Logger log)
                 Eigen::AngleAxisd(-yaw_init, V3D(0,0,1)));
             pcl::transformPointCloud(*scan, *scan, T_sc);
 
-            PointCloudXYZI::Ptr kf_cloud(new PointCloudXYZI());
-            const std::string kf_pcd = map_scan_dir_param + "/" + std::to_string(match_id) + ".pcd";
-            if (pcl::io::loadPCDFile(kf_pcd, *kf_cloud) < 0) { continue; }
+            // Each matched keyframe is read from disk once and kept: the map is
+            // fixed for the life of the process, and re-reading the same PCD for
+            // every candidate added file I/O to every step of the search.
+            // Only this thread touches the cache.
+            static std::unordered_map<int, PointCloudXYZI::Ptr> kf_cache;
+            PointCloudXYZI::Ptr kf_cloud;
+            {
+                auto it = kf_cache.find(match_id);
+                if (it != kf_cache.end()) {
+                    kf_cloud = it->second;
+                } else {
+                    kf_cloud.reset(new PointCloudXYZI());
+                    const std::string kf_pcd = map_scan_dir_param + "/" + std::to_string(match_id) + ".pcd";
+                    if (pcl::io::loadPCDFile(kf_pcd, *kf_cloud) < 0) { continue; }
+                    kf_cache.emplace(match_id, kf_cloud);
+                }
+            }
 
             // Coarse then fine: coarse survives a hit that is the right PLACE
             // but metres off; fine is the answer.
@@ -508,6 +534,13 @@ void global_localization_thread(rclcpp::Logger log)
                         kept_count, init_agree_count, match_id, 100.0 * ov);
         }
 
+        // Left the inner loop because a lock or a shutdown arrived, not because
+        // enough candidates did -- do not evaluate the window.
+        {
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            if (global_localization_finish || !keep_searching) continue;
+        }
+
         std::vector<int> ids;
         std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> poses;
         {
@@ -525,8 +558,12 @@ void global_localization_thread(rclcpp::Logger log)
         //     predicted_0 = pose_i * T_odom(id_i)^-1 * T_odom(id_0)
         double spread = 0.0;
         for (size_t i = 1; i < poses.size(); ++i) {
+            // Always, not only under init_require_motion (which defaults off):
+            // that flag gates whether motion is DEMANDED between estimates, but
+            // a moving robot still covers distance between them either way, and
+            // uncompensated that distance counted against a correct pair.
             Eigen::Matrix4d Pi = poses[i];
-            if (init_require_motion) {
+            {
                 Eigen::Matrix4d T0, Ti;
                 if (odom_at(ids[0], T0) && odom_at(ids[i], Ti)) {
                     Pi = poses[i] * Ti.inverse() * T0;
@@ -540,10 +577,14 @@ void global_localization_thread(rclcpp::Logger log)
         }
 
         if (spread < init_agree_dist) {
-            init_result.first  = ids[0];
-            init_result.second = poses[0];
             {
+                // The NEWEST agreeing estimate: the handover carries the lock
+                // forward through odometry from its scan to now, so the
+                // freshest scan leaves the least to extrapolate. Written under
+                // the same mutex as the flag the scan timer reads it by.
                 std::lock_guard<std::mutex> lk(init_state_mutex);
+                init_result.first  = ids.back();
+                init_result.second = poses.back();
                 global_localization_finish = true;
             }
             {
@@ -881,13 +922,13 @@ public:
         }
 
         // /relocalize -- "I do not trust where I think I am". Re-arms the
-        // ScanContext search from scratch.
-        //
-        // The prior map STAYS in the ikd-Tree while searching: the search thread
-        // does not use it, and rebuilding a 4.5M-point tree on a service call is
-        // not worth it. While lost the filter finds no correspondences and
-        // coasts on IMU. That does not corrupt the answer -- the new lock is
-        // applied relative to the odometry at lock, so the error cancels.
+        // ScanContext search from scratch and hands the filter a fresh LIVE map
+        // (see rearm_search()). The next lock is carried forward through the
+        // odometry accumulated since its scan, so that odometry has to be real
+        // registration, not IMU coasting against a prior map the filter is no
+        // longer aligned with -- the error does not cancel, it IS the
+        // extrapolation. The prior map stays loaded in ikdtree_global and is
+        // shared back into the filter at the next lock.
         srv_relocalize_ = this->create_service<std_srvs::srv::Trigger>(
             "/relocalize",
             [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
@@ -949,6 +990,18 @@ public:
                 {
                     std::lock_guard<std::mutex> lk(init_state_mutex);
                     global_localization_finish = true; // stand the search down
+                }
+                // Drop what the search was holding, so a later re-arm cannot
+                // pair a pre-seed candidate with a fresh one.
+                {
+                    std::lock_guard<std::mutex> lk(candidate_mutex);
+                    candidate_ids.clear();
+                    candidate_poses.clear();
+                }
+                {
+                    std::lock_guard<std::mutex> lk(init_feats_mutex);
+                    std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
+                    std::swap(init_feats_down_bodys, empty);
                 }
                 RCLCPP_INFO(this->get_logger(),
                     "/initialpose accepted: seeding at x=%.2f y=%.2f yaw=%.1f deg "
@@ -1112,7 +1165,16 @@ private:
             //   T_map_now = T_map_at_lock * T_odom_at_lock^-1 * T_odom_now
             // A seed takes precedence and is applied directly, with no
             // carry-forward, so it is correct with or without an existing lock.
-            if (has_pending_seed.exchange(false))
+            // Hold a seed until IMU initialization is done. Until then
+            // IMU_init() runs every scan: it sets grav from the mean
+            // accelerometer as if the attitude were still the start frame, and
+            // resets P. A seed applied earlier kept its map-frame attitude but
+            // got start-frame gravity and its widened P reset, and the filter
+            // diverged -- MEASURED: seeded at the correct pose ~3 s into the
+            // Sep 10 bag, overlap fell to 0 and the health check re-armed at
+            // +9 s. A ScanContext lock cannot land that early (it needs
+            // processed scans), so only this path needs the guard.
+            if (p_imu->imu_initialized() && has_pending_seed.exchange(false))
             {
                 Eigen::Matrix4d T_map_now;
                 {
@@ -1140,8 +1202,10 @@ private:
                     kf.change_P(P);
                 }
                 state_point = kf.get_x();
+                // Shared, not moved: ikdtree_global keeps the prior map so a
+                // later lock can hand it back after a re-arm.
                 if (!map_swapped) {
-                    ikdtree = std::move(ikdtree_global);
+                    ikdtree = ikdtree_global;
                     map_swapped = true;
                 }
                 global_update = true;
@@ -1151,11 +1215,12 @@ private:
             }
 
             {
-                /*** init_result is published BEFORE global_localization_finish
-                 *** under this mutex, so copying both here is the acquire side
-                 *** of that release -- and it stops /relocalize, which re-arms
-                 *** from the executor thread, republishing init_result midway
-                 *** through this read. ***/
+                /*** The search thread writes init_result and sets
+                 *** global_localization_finish under this mutex, so both are
+                 *** read under it here. (/relocalize cannot interleave: this
+                 *** node spins a single-threaded executor, so it and this timer
+                 *** run one at a time. The search thread is the only
+                 *** concurrent writer.) ***/
                 int id = -1;
                 Eigen::Matrix4d T_cand = Eigen::Matrix4d::Identity();
                 bool locked = false;
@@ -1165,9 +1230,8 @@ private:
                     if (locked) { id = init_result.first; T_cand = init_result.second; }
                 }
                 // odom_at() does the locked, bounds-checked read this file already
-                // uses everywhere else. rearm_search() clears the trail from
-                // another thread, so an unchecked pose_init[id] is an
-                // out-of-range vector read.
+                // uses everywhere else. A re-arm clears the trail and restarts
+                // ids at 0, so an id from before it must not index the new one.
                 Eigen::Matrix4d T_odom_lock;
                 bool trail_ok = false;
                 if (locked && !global_update) {
@@ -1209,12 +1273,24 @@ private:
                     // bg/ba are body-frame biases and offset_R/T_L_I is the
                     // lidar-IMU extrinsic; none are world-frame.
                     kf.change_x(gs);
+                    // A lock is a jump the filter did not measure: ICP fixes the
+                    // pose at an OLD scan and odometry extrapolates it to now.
+                    // change_x() alone keeps P at the pre-jump track's
+                    // confidence, so the filter resists the map correcting the
+                    // extrapolation. Open pos and rot the way the /initialpose
+                    // path does and let the next scans pull it in.
+                    {
+                        auto P = kf.get_P();
+                        P.block<3, 3>(0, 0) = M3D::Identity() * seed_pos_cov_;
+                        P.block<3, 3>(3, 3) = M3D::Identity() * seed_rot_cov_;
+                        kf.change_P(P);
+                    }
                     state_point = kf.get_x();
 
-                    // Hand the filter the prior map -- but only the FIRST time.
-                    // ikdtree_global is moved-from afterwards.
+                    // Hand the filter the prior map. Shared, not moved:
+                    // ikdtree_global keeps it for the next lock after a re-arm.
                     if (!map_swapped) {
-                        ikdtree = std::move(ikdtree_global);
+                        ikdtree = ikdtree_global;
                         map_swapped = true;
                     }
                     global_update = true;
@@ -1321,8 +1397,9 @@ private:
             // global_update, so gating on it re-opened the prior map for writing
             // for the whole duration of a /relocalize or auto-relocalize --
             // merging in exactly the scans whose pose was just declared
-            // untrustworthy. Once the prior map is in the tree it stays
-            // read-only for the life of the process.
+            // untrustworthy. While the tree IS the prior map it stays
+            // read-only; a re-arm swaps in a fresh live tree and clears
+            // map_swapped, and only that live tree is written.
             if (!map_swapped) {
                 map_incremental();
             }
@@ -1332,25 +1409,32 @@ private:
             // Feed the init thread while still searching: the undistorted,
             // downsampled scan plus the odometry pose it was taken at, so a lock
             // found several scans later can be carried forward to now.
-            if (!global_localization_finish)
+            bool searching;
+            {
+                std::lock_guard<std::mutex> lk(init_state_mutex);
+                searching = !global_localization_finish;
+            }
+            if (searching)
             {
                 PointCloudXYZI::Ptr snapshot(new PointCloudXYZI());
                 pcl::copyPointCloud(*feats_down_body, *snapshot);
-                {
-                    // The trail and the queue are ONE unit: the id queued with a
-                    // scan indexes into these vectors, so appending outside the
-                    // lock would race the search thread and /relocalize's clear.
-                    position_init.push_back(state_point.pos);
-                    pose_init.push_back(state_point.rot);
-                    // Bounded, and biased to the NEWEST scans: ScanContext plus
-                    // two ICP passes are slower than the scan rate, so dropping
-                    // new arrivals left the search working through the stalest
-                    // scans in the buffer and every lock landed behind the robot.
-                    // Evict the oldest instead.
-                    while (init_feats_down_bodys.size() >= 5)
-                        init_feats_down_bodys.pop();
-                    init_feats_down_bodys.push({init_count, snapshot});
-                }
+                // The trail and the queue are ONE unit: the id queued with a scan
+                // indexes into these vectors. The search thread pops the queue
+                // and odom_at() reads the trail under init_feats_mutex, so they
+                // are appended under it too. This block used to say so without
+                // taking the lock -- a push_back that reallocates the trail while
+                // the search thread reads it is undefined behaviour.
+                std::lock_guard<std::mutex> lk(init_feats_mutex);
+                position_init.push_back(state_point.pos);
+                pose_init.push_back(state_point.rot);
+                // Bounded, and biased to the NEWEST scans: ScanContext plus two
+                // ICP passes are slower than the scan rate, so dropping new
+                // arrivals left the search working through the stalest scans in
+                // the buffer and every lock landed behind the robot. Evict the
+                // oldest instead.
+                while (init_feats_down_bodys.size() >= 5)
+                    init_feats_down_bodys.pop();
+                init_feats_down_bodys.push({init_count, snapshot});
                 init_count++;
             }
 
@@ -1422,6 +1506,22 @@ private:
             global_localization_finish = false;   // re-arm the search
         }
         global_update = false;                    // allow a new teleport
+
+        // Give the filter a LIVE map again. After a handover the tree is the
+        // prior map and nothing writes to it, so a filter just declared lost
+        // had no map of its own: it coasted on IMU or matched the prior map
+        // from the wrong pose, and the next lock -- carried forward through
+        // that odometry -- inherited the error. A fresh tree is built from the
+        // next scan (the Root_Node == nullptr path in timer_callback), and
+        // map_incremental / lasermap_fov_segment run on it until the next lock
+        // shares the prior map back in. Safe to swap here: rearm_search() runs
+        // on the executor thread, the same one as timer_callback, and the
+        // search thread never touches ikdtree.
+        if (map_swapped) {
+            ikdtree = std::make_shared<KD_TREE<PointType>>();
+            map_swapped = false;
+            Localmap_Initialized = false;         // re-centre the local-map cube here
+        }
     }
 
     // Runs at health_check_period_ Hz, only once locked. Re-scores the CURRENT

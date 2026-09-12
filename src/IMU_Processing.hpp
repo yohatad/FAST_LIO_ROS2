@@ -71,6 +71,9 @@ class ImuProcess
   // Bias-corrected body-frame angular velocity from the last propagation step.
   // Zero until the first Process() call.
   const V3D &get_angvel_last() const { return angvel_last; }
+  // False until MAX_INI_COUNT IMU samples are in. Until then IMU_init() runs
+  // every scan and rewrites grav and P, so nothing may jump the state yet.
+  bool imu_initialized() const { return !imu_need_init_; }
 
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
