@@ -25,6 +25,7 @@
 #include <lifecycle_msgs/msg/state.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include "Scancontext/Scancontext.h"
 #include <pcl/registration/icp.h>
 #include <queue>
@@ -80,6 +81,12 @@ std::mutex       candidate_mutex;
 /* --- search state --- guarded by init_state_mutex --- */
 bool       global_localization_finish = false;          // a lock has been FOUND
 bool       keep_searching = true;                       // on_deactivate() clears this to stop the thread
+// Set once max_relock_attempts_ locks have been claimed and then lost (see
+// record_relock_attempt). The search thread then IDLES rather than hunting for
+// another candidate that would fail the same way -- in self-similar geometry
+// the same aliased match comes back, so retrying forever just repeats it.
+// Only /initialpose or /relocalize, both operator actions, clear it.
+bool       search_halted = false;
 std::mutex init_state_mutex;
 std::pair<int, Eigen::Matrix4d> init_result;            // {trail id, map <- IMU} of the accepted lock
 
@@ -100,6 +107,17 @@ std::string map_dir_param;                              // directory holding the
 std::string map_pose_file_param;                        // pose file; bare name or absolute path
 std::string map_scan_dir_param;                         // holds <N>.pcd; default <map_dir>/pcd
 
+// /Odometry's frame_id BEFORE a lock is applied (and again after a re-arm).
+// The filter is in its own arbitrary-origin, mount-tilted frame then, NOT the
+// map: stamping it map_frame regardless -- stock FAST-LIO behaviour -- put an
+// unverified, drifting pose on the wire labelled as if it were map-registered,
+// which is what drew the robot at the map origin travelling through walls
+// until a lock snapped it into place. The TF broadcast and /localization/pose
+// already wait for global_update; this is the one message that did not.
+// Named to match the mapping stack's own name for the same concept
+// (config/*.yaml map_frame: "lio_init", see pepper_slam/FRAMES.md).
+std::string odom_init_frame = "lio_init";
+
 /* --- initial-pose search tuning (parameters) --- */
 int    init_agree_count   = 2;                          // independent estimates that must agree
 double init_agree_dist    = 2.0;                        // m they must agree within, odometry-compensated
@@ -108,9 +126,6 @@ double init_icp_fine      = 1.0;                        // m max correspondence,
 double init_min_overlap   = 0.70;                       // fraction of the scan that must land on the map
 double init_overlap_dist  = 0.20;                       // m; nearer than this counts as "on the map"
                                                         //   keep tight: at 1.0 m a lock 41 m out scored ~100%
-bool   init_require_motion = false;                     // demand travel between agreeing estimates
-                                                        //   OFF: it blocks a stationary /initialpose start
-double init_motion_min    = 0.50;                       // m of odometry between them when ON
 
 /* --- ScanContext descriptor geometry (parameters) ---
    Sized to THIS sensor, not upstream's 64-beam car lidar; see Scancontext.h. */
@@ -174,7 +189,18 @@ bool resolve_tf_child()
 
 void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = map_frame;
+    // Not map_frame until locked: see odom_init_frame's comment.
+    odomAftMapped.header.frame_id = global_update ? map_frame : odom_init_frame;
+    // The shared cloud/path publishers (fastlio_core.hpp) stamp world-frame
+    // messages with world_pub_frame; mirror it here so /cloud_registered,
+    // /path and /Laser_map carry the SAME honest frame_id as /Odometry this
+    // scan instead of all claiming map_frame regardless of the lock.
+    world_pub_frame = odomAftMapped.header.frame_id;
+    // Carry lock state into /cloud_registered so the scan reads GREEN once
+    // locked and RED while still searching. Overwrites the sensor intensity in
+    // that VISUALIZATION cloud only -- the filter registers against
+    // feats_down_body, which is untouched.
+    world_pub_intensity = global_update ? 100.0f : 0.0f;
     odomAftMapped.child_frame_id = body_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
@@ -389,11 +415,12 @@ void global_localization_thread(rclcpp::Logger log)
     rclcpp::Rate rate(20);
     while (rclcpp::ok())
     {
-        bool already_locked, keep_going;
+        bool already_locked, keep_going, halted;
         {
             std::lock_guard<std::mutex> lk(init_state_mutex);
             already_locked = global_localization_finish;
             keep_going = keep_searching;
+            halted = search_halted;
         }
         // on_deactivate() clears this and joins us -- exit promptly rather than
         // idle-sleeping through a transition that is waiting on us.
@@ -401,6 +428,9 @@ void global_localization_thread(rclcpp::Logger log)
         // Idle, not finished: /relocalize clears this flag to re-arm the
         // search, so returning here would make relocalization impossible.
         if (already_locked) { rate.sleep(); continue; }
+        // Out of attempts (record_relock_attempt): stop hunting. Idle until an
+        // operator calls /initialpose or /relocalize.
+        if (halted) { rate.sleep(); continue; }
         if (!map_loaded) { rate.sleep(); continue; }
 
         auto candidate_count = []() {
@@ -503,25 +533,6 @@ void global_localization_thread(rclcpp::Logger log)
                             match_id, 100.0 * ov, 100.0 * init_min_overlap);
                 continue;
             }
-            // Motion gate: the candidate must come from a scan the robot has
-            // actually travelled from, or it is not independent evidence.
-            int oldest_id = -1;
-            {
-                std::lock_guard<std::mutex> lk(candidate_mutex);
-                if (!candidate_ids.empty()) oldest_id = candidate_ids.front();
-            }
-            if (init_require_motion && oldest_id != -1) {
-                Eigen::Matrix4d T0, Tn;
-                if (!odom_at(oldest_id, T0) || !odom_at(item.first, Tn)) continue;
-                const double moved =
-                    (Tn.block<3,1>(0,3) - T0.block<3,1>(0,3)).norm();
-                if (moved < init_motion_min) {
-                    RCLCPP_INFO(log, "[init] holding: only %.2f m travelled since "
-                                     "the oldest kept estimate (need %.2f) -- move the robot",
-                                moved, init_motion_min);
-                    continue;
-                }
-            }
             int kept_count;
             {
                 std::lock_guard<std::mutex> lk(candidate_mutex);
@@ -558,10 +569,8 @@ void global_localization_thread(rclcpp::Logger log)
         //     predicted_0 = pose_i * T_odom(id_i)^-1 * T_odom(id_0)
         double spread = 0.0;
         for (size_t i = 1; i < poses.size(); ++i) {
-            // Always, not only under init_require_motion (which defaults off):
-            // that flag gates whether motion is DEMANDED between estimates, but
-            // a moving robot still covers distance between them either way, and
-            // uncompensated that distance counted against a correct pair.
+            // A moving robot covers real distance between the two estimates,
+            // and uncompensated that distance counted against a correct pair.
             Eigen::Matrix4d Pi = poses[i];
             {
                 Eigen::Matrix4d T0, Ti;
@@ -717,10 +726,6 @@ public:
         this->get_parameter("localization.sc_dist_thres", sc_dist_thres);
         this->get_parameter("localization.sc_num_ring", sc_num_ring);
         this->get_parameter("localization.sc_num_sector", sc_num_sector);
-        this->declare_parameter<bool>("localization.init_require_motion", true);
-        this->declare_parameter<double>("localization.init_motion_min", 0.50);
-        this->get_parameter("localization.init_require_motion", init_require_motion);
-        this->get_parameter("localization.init_motion_min", init_motion_min);
         this->declare_parameter<double>("localization.init_min_overlap", 0.60);
         this->declare_parameter<double>("localization.init_overlap_dist", 1.0);
         this->get_parameter("localization.init_min_overlap", init_min_overlap);
@@ -729,15 +734,34 @@ public:
         this->get_parameter("localization.prior_map_view_leaf", prior_map_view_leaf);
         // Post-lock health check: re-runs map_overlap() against the LIVE tracked
         // pose (see health_check_callback). A wrong-but-self-consistent lock
-        // produces no other symptom -- effct_feat_num stays healthy.
+        // produces no other symptom -- effct_feat_num stays healthy. REPORTS
+        // ONLY: it publishes /localization/overlap and /diagnostics and logs,
+        // and never touches the lock itself.
         this->declare_parameter<double>("localization.health_min_overlap", 0.45);
         this->declare_parameter<double>("localization.health_bad_duration", 5.0);
         this->declare_parameter<double>("localization.health_check_period", 1.0);
-        this->declare_parameter<bool>("localization.auto_relocalize", true);
         this->get_parameter("localization.health_min_overlap", health_min_overlap_);
         this->get_parameter("localization.health_bad_duration", health_bad_duration_);
         this->get_parameter("localization.health_check_period", health_check_period_);
-        this->get_parameter("localization.auto_relocalize", auto_relocalize_);
+        // Consecutive live scans a candidate lock must score >= init_min_overlap
+        // on before the filter is teleported and the prior map swapped in (see
+        // verify_and_apply_lock). At the ~10 Hz scan rate 3 is about 0.3 s, so
+        // this costs almost nothing and a wrong candidate is rejected without
+        // ever disturbing the filter. 1 restores the old commit-immediately
+        // behaviour.
+        this->declare_parameter<int>("localization.lock_verify_scans", 3);
+        this->get_parameter("localization.lock_verify_scans", lock_verify_scans_);
+        this->declare_parameter<double>("localization.no_match_duration", 1.0);
+        this->get_parameter("localization.no_match_duration", no_match_duration_);
+        // Locks claimed and then lost before the automatic search gives up and
+        // waits for a manual /initialpose. 0 disables the halt (retry forever).
+        this->declare_parameter<int>("localization.max_relock_attempts", 2);
+        this->get_parameter("localization.max_relock_attempts", max_relock_attempts_);
+        // Platform speed limit used ONLY to detect a diverging open-loop
+        // estimate (see the clamp in the zero-match guard). Raise it for a
+        // faster base; it must stay above anything the robot can really do.
+        this->declare_parameter<double>("localization.max_speed", 1.0);
+        this->get_parameter("localization.max_speed", max_speed_);
         // Covariance the filter is reset to after an /initialpose teleport, in
         // m^2 and rad^2. Defaults are a loose ~0.7 m / ~11 deg one-sigma, which
         // is about how well an operator can place a pose in RViz.
@@ -757,6 +781,18 @@ public:
             this->create_publisher<std_msgs::msg::Float32>("/localization/overlap", 10);
         pubDiagnostics_ =
             this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
+        // What the search is CURRENTLY testing, so the hunt is visible instead
+        // of being a silent gap between "searching" and "Localized". Both are
+        // in map_frame and are republished on every verification check, so in
+        // RViz the candidate visibly hops between places as they are tried and
+        // rejected. candidate_scan is the live scan placed AT the candidate
+        // pose -- laid over /prior_map it shows at a glance whether the
+        // alignment is real or nonsense, which the overlap percentage alone
+        // does not convey.
+        pubCandidatePose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+            "/localization/candidate_pose", 10);
+        pubCandidateScan_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+            "/localization/candidate_scan", 10);
         tf_buffer_g = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         // spin_thread=true: the listener needs its OWN thread. On this node's
         // single-threaded executor the scan callback runs the whole iEKF update
@@ -784,6 +820,9 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
         this->get_parameter_or<bool>("publish.publish_tf", publish_tf_en, true);
         this->get_parameter_or<string>("publish.map_frame", map_frame, "camera_init");
+        this->declare_parameter<string>("publish.odom_init_frame", "lio_init");
+        this->get_parameter_or<string>("publish.odom_init_frame", odom_init_frame, "lio_init");
+        world_pub_frame = odom_init_frame;   // sane value before the first scan
         this->get_parameter_or<string>("publish.body_frame", body_frame, "body");
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
@@ -861,6 +900,32 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        // ANCHOR THE MAP FRAME so RViz has a Fixed Frame from startup.
+        //
+        // Without this, map_frame does not exist in TF until the first lock:
+        // publish_odometry() returns before broadcasting map -> tf_child while
+        // !global_update, and in the standalone launch nothing else publishes
+        // it (no map_server). RViz then reports "Fixed Frame [map] does not
+        // exist" and draws NOTHING -- not even /prior_map, which is stamped
+        // map_frame, because the fixed frame itself must be in the tree. So
+        // during the one phase you actually want to watch, the view is blank.
+        //
+        // This edge is map -> odom_init_frame ONLY, and identity. It does not
+        // reach the robot: nothing publishes odom_init_frame -> body until a
+        // lock, so no consumer can resolve a map-relative robot pose from it,
+        // and nav2 still cannot navigate on an unverified pose. It exists
+        // purely so the prior map is visible and the un-localized LIO cloud
+        // has somewhere to render.
+        static_tf_broadcaster_ =
+            std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+        {
+            geometry_msgs::msg::TransformStamped anchor;
+            anchor.header.stamp = this->get_clock()->now();
+            anchor.header.frame_id = map_frame;
+            anchor.child_frame_id = odom_init_frame;
+            anchor.transform.rotation.w = 1.0;
+            static_tf_broadcaster_->sendTransform(anchor);
+        }
 
         //------------------------------------------------------------------------------------------------------
         // Load the prior map and arm the search BEFORE the scan pipeline starts.
@@ -938,6 +1003,15 @@ public:
                     res->message = "prior map not loaded";
                     return;
                 }
+                // An explicit operator request for another try gets a fresh
+                // budget -- otherwise a single /relocalize after the search
+                // already gave up would walk straight back into search_halted
+                // on the very next failed lock.
+                relock_attempts_ = 0;
+                {
+                    std::lock_guard<std::mutex> lk(init_state_mutex);
+                    search_halted = false;
+                }
                 rearm_search();
                 RCLCPP_WARN(this->get_logger(),
                     "/relocalize: searching again. The pose is NOT trustworthy "
@@ -987,9 +1061,13 @@ public:
                     pending_seed = T_map_body;
                 }
                 has_pending_seed = true;
+                // The operator is providing the pose, so the automatic search
+                // gets a clean slate: clear any halt and restore the budget.
+                relock_attempts_ = 0;
                 {
                     std::lock_guard<std::mutex> lk(init_state_mutex);
                     global_localization_finish = true; // stand the search down
+                    search_halted = false;
                 }
                 // Drop what the search was holding, so a later re-arm cannot
                 // pair a pre-seed candidate with a fresh one.
@@ -1031,6 +1109,8 @@ public:
         pubPath_->on_activate();
         pubPriorMap_->on_activate();
         pubLocalizationOverlap_->on_activate();
+        pubCandidatePose_->on_activate();
+        pubCandidateScan_->on_activate();
         pubDiagnostics_->on_activate();
         pub_localization_g->on_activate();
 
@@ -1086,6 +1166,8 @@ public:
         pubPath_->on_deactivate();
         pubPriorMap_->on_deactivate();
         pubLocalizationOverlap_->on_deactivate();
+        pubCandidatePose_->on_deactivate();
+        pubCandidateScan_->on_deactivate();
         pubDiagnostics_->on_deactivate();
         pub_localization_g->on_deactivate();
 
@@ -1202,105 +1284,32 @@ private:
                     kf.change_P(P);
                 }
                 state_point = kf.get_x();
+                // UNCONDITIONAL, not `if (!map_swapped)`. The operator is
+                // asserting where the robot is, so whatever tree was in use
+                // before is discarded outright: pre-lock that is a live map
+                // accumulated around a pose now declared wrong, and post-lock
+                // it is the prior map positioned by a lock now being
+                // overridden. Either way its points describe the old belief,
+                // and reassigning the shared_ptr drops the old tree entirely.
+                // The guard meant a seed issued while already locked left the
+                // previous tree in place.
+                //
                 // Shared, not moved: ikdtree_global keeps the prior map so a
                 // later lock can hand it back after a re-arm.
-                if (!map_swapped) {
-                    ikdtree = ikdtree_global;
-                    map_swapped = true;
-                }
+                ikdtree = ikdtree_global;
+                map_swapped = true;
+                Localmap_Initialized = false;   // re-centre the local-map cube
                 global_update = true;
+                has_ever_locked_ = true;
                 RCLCPP_INFO(this->get_logger(),
-                    "Seeded from /initialpose: filter is now at x=%.2f y=%.2f z=%.2f",
+                    "Seeded from /initialpose: filter is now at x=%.2f y=%.2f "
+                    "z=%.2f; previous map discarded, prior map in use.",
                     gs.pos(0), gs.pos(1), gs.pos(2));
             }
 
-            {
-                /*** The search thread writes init_result and sets
-                 *** global_localization_finish under this mutex, so both are
-                 *** read under it here. (/relocalize cannot interleave: this
-                 *** node spins a single-threaded executor, so it and this timer
-                 *** run one at a time. The search thread is the only
-                 *** concurrent writer.) ***/
-                int id = -1;
-                Eigen::Matrix4d T_cand = Eigen::Matrix4d::Identity();
-                bool locked = false;
-                {
-                    std::lock_guard<std::mutex> lk(init_state_mutex);
-                    locked = global_localization_finish;
-                    if (locked) { id = init_result.first; T_cand = init_result.second; }
-                }
-                // odom_at() does the locked, bounds-checked read this file already
-                // uses everywhere else. A re-arm clears the trail and restarts
-                // ids at 0, so an id from before it must not index the new one.
-                Eigen::Matrix4d T_odom_lock;
-                bool trail_ok = false;
-                if (locked && !global_update) {
-                    trail_ok = odom_at(id, T_odom_lock);
-                    if (!trail_ok) {
-                        RCLCPP_WARN(this->get_logger(),
-                            "[init] lock references trail entry %d but the trail was "
-                            "re-armed underneath it; discarding.", id);
-                        rearm_search();
-                    }
-                }
-                if (trail_ok)
-                {
-                    Eigen::Matrix4d T_odom_now = Eigen::Matrix4d::Identity();
-                    T_odom_now.block<3,3>(0,0) = state_point.rot.toRotationMatrix();
-                    T_odom_now.block<3,1>(0,3) = state_point.pos;
-
-                    const Eigen::Matrix4d T_map_now =
-                        T_cand * T_odom_lock.inverse() * T_odom_now;
-
-                    // The handover is a change of WORLD FRAME, not just a pose
-                    // edit, so every world-frame quantity has to rotate with it
-                    // -- not only pos/rot.
-                    //
-                    // Upstream sets pos and rot alone, which is only safe when
-                    // the map and LIO start frames nearly coincide. This map is
-                    // levelled ~90 deg off the LIO start attitude, so leaving
-                    // grav behind points gravity sideways in the new frame and
-                    // the filter diverges within a few scans.
-                    const M3D R_old = state_point.rot.toRotationMatrix();
-                    const M3D R_new = T_map_now.block<3,3>(0,0);
-                    const M3D R_delta = R_new * R_old.transpose();
-
-                    state_ikfom gs = state_point;
-                    gs.pos  = T_map_now.block<3,1>(0,3);
-                    gs.rot  = R_new;
-                    gs.vel  = R_delta * state_point.vel;      // world-frame velocity
-                    gs.grav = S2(V3D(R_delta * state_point.grav.vec));
-                    // bg/ba are body-frame biases and offset_R/T_L_I is the
-                    // lidar-IMU extrinsic; none are world-frame.
-                    kf.change_x(gs);
-                    // A lock is a jump the filter did not measure: ICP fixes the
-                    // pose at an OLD scan and odometry extrapolates it to now.
-                    // change_x() alone keeps P at the pre-jump track's
-                    // confidence, so the filter resists the map correcting the
-                    // extrapolation. Open pos and rot the way the /initialpose
-                    // path does and let the next scans pull it in.
-                    {
-                        auto P = kf.get_P();
-                        P.block<3, 3>(0, 0) = M3D::Identity() * seed_pos_cov_;
-                        P.block<3, 3>(3, 3) = M3D::Identity() * seed_rot_cov_;
-                        kf.change_P(P);
-                    }
-                    state_point = kf.get_x();
-
-                    // Hand the filter the prior map. Shared, not moved:
-                    // ikdtree_global keeps it for the next lock after a re-arm.
-                    if (!map_swapped) {
-                        ikdtree = ikdtree_global;
-                        map_swapped = true;
-                    }
-                    global_update = true;
-
-                    RCLCPP_INFO(this->get_logger(),
-                        "Localized: filter is now in the map frame at "
-                        "x=%.2f y=%.2f z=%.2f; prior map is read-only from here.",
-                        gs.pos(0), gs.pos(1), gs.pos(2));
-                }
-            }
+            // The ScanContext lock is NOT applied here. It is verified against
+            // live scans first, after this scan's iEKF update -- see
+            // verify_and_apply_lock().
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
@@ -1379,6 +1388,130 @@ private:
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
+
+            // ZERO-MATCH GUARD.
+            //
+            // effct_feat_num == 0 means h_share_model found no usable
+            // correspondence for ANY point, so it set ekfom_data.valid = false
+            // and the iEKF applied no correction at all: this scan measured
+            // nothing. Consecutive zero-match scans are therefore pure IMU
+            // propagation, where a residual accelerometer-bias or gravity
+            // error is a constant phantom acceleration and position error
+            // grows QUADRATICALLY. MEASURED post-lock in a corner: 3870
+            // consecutive zero-match scans carried the pose 1.6 km away, with
+            // the per-sample step still growing (204 -> 238 -> 272 -> 311 m
+            // per 3 s) -- and it could never recover, because at that distance
+            // no correspondence will ever be found again and map_incremental
+            // is disabled while the prior map is loaded.
+            //
+            // Re-arming is what breaks the trapdoor: rearm_search() hands the
+            // filter a fresh LIVE tree, so it immediately has something
+            // self-consistent to track against again instead of running away.
+            //
+            // Reacts far faster than health_check_callback (5 s) on purpose:
+            // that check is tuned for a wrong-but-trackable lock, where a
+            // single low reading is normal. Zero effective points for a full
+            // second is not something a correct lock produces even briefly.
+            // PHYSICAL PLAUSIBILITY GUARD -- velocity AND IMU biases are ZEROED.
+            //
+            // UNCONDITIONAL, deliberately. This was first written to fire only
+            // while open-loop (effct_feat_num == 0), on the reasoning that a
+            // corrected velocity is observed and must not be touched. That was
+            // wrong and MEASURED wrong: with a bad lock the filter reported
+            // -5.0 m/s on scans where it DID find correspondences, so the
+            // clamp never ran and the pose still jumped 1.7 -> 5.7 -> 19.6 ->
+            // -10.6 m. Wrong correspondences produce a wrong velocity just as
+            // readily as no correspondences do.
+            //
+            // A Pepper tops out near 0.55 m/s. Above max_speed_ the estimate
+            // is broken whatever produced it. It is set to ZERO rather than
+            // scaled back to max_speed_: there is no information left in a
+            // diverging velocity, and capping it at 1.0 m/s would still let
+            // the pose travel 60 m/min. Zero is the only defensible value for
+            // a wheeled robot whose estimate has failed, and it kills the
+            // quadratic position runaway at its source, since position only
+            // integrates velocity. This can never clip real motion.
+            if (state_point.vel.norm() > max_speed_) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "[health] velocity %.1f m/s exceeds this robot's %.2f m/s "
+                    "limit (effective points: %d) -- the estimate is diverging, "
+                    "not moving. Velocity and IMU biases reset to zero.",
+                    state_point.vel.norm(), max_speed_, effct_feat_num);
+                state_ikfom sv = state_point;
+                sv.vel = V3D(0, 0, 0);
+                // The IMU biases go with it. There is no acceleration STATE to
+                // reset -- acceleration is an input (input_ikfom) -- but ba is
+                // exactly what turns into phantom acceleration: the propagation
+                // integrates (a_meas - ba + g), so a ba that has absorbed
+                // garbage keeps producing acceleration that is not happening,
+                // and zeroing the velocity alone would just let it build the
+                // same runaway straight back up. bg does the same for
+                // orientation. A diverged filter has corrupted both, and 0 is
+                // the correct prior for a bias.
+                sv.ba = V3D(0, 0, 0);
+                sv.bg = V3D(0, 0, 0);
+                kf.change_x(sv);
+                // Re-open vel (12-14), bg (15-17) and ba (18-20) so the next
+                // scans actually re-estimate them. Zeroing with the old, tight
+                // covariance would leave the filter CONFIDENT in the zeros and
+                // unable to correct them (state layout: use-ikfom.hpp).
+                {
+                    auto P = kf.get_P();
+                    P.block<3, 3>(12, 12) = M3D::Identity() * 1.0;
+                    P.block<3, 3>(15, 15) = M3D::Identity() * 1e-2;
+                    P.block<3, 3>(18, 18) = M3D::Identity() * 1e-2;
+                    kf.change_P(P);
+                }
+                state_point = kf.get_x();
+            }
+
+            if (effct_feat_num < 1) {
+                const rclcpp::Time now = this->get_clock()->now();
+                if (!no_match_bad_) { no_match_bad_ = true; no_match_since_ = now; }
+                const double bad_for = (now - no_match_since_).seconds();
+                if (bad_for >= no_match_duration_) {
+                    if (global_update) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "[health] zero effective points for %.1f s -- this lock "
+                            "cannot be tracked and the pose is diverging on IMU "
+                            "alone. Dropping it and searching again.", bad_for);
+                        publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::ERROR,
+                            "Zero-match lock dropped; searching again");
+                        // A lock was genuinely claimed and lost -- count it,
+                        // and halt the search once the budget is spent.
+                        record_relock_attempt();
+                    } else {
+                        RCLCPP_WARN(this->get_logger(),
+                            "[init] zero effective points for %.1f s before ever "
+                            "locking -- resetting local tracking so the odometry "
+                            "trail a lock is carried forward through cannot be "
+                            "corrupted by unbounded drift.", bad_for);
+                    }
+                    rearm_search();
+                    no_match_bad_ = false;
+                    // MUST return. rearm_search() replaces ikdtree with a fresh,
+                    // never-Build()'d tree (Root_Node == nullptr) whenever the
+                    // prior map was loaded. health_check_callback -- its other
+                    // caller -- runs on a separate timer, never mid-scan, so the
+                    // NEXT timer_callback safely hits the Root_Node == nullptr ->
+                    // Build() path first. Called from HERE, inside this same
+                    // scan, that guarantee breaks: falling through to
+                    // map_incremental() below would call Add_Points() on an
+                    // unbuilt tree and segfault inside ikd-Tree (MEASURED).
+                    // Nothing valid remains to do with this scan anyway.
+                    return;
+                }
+            } else {
+                no_match_bad_ = false;
+            }
+
+            // Score a pending lock against THIS scan, and only teleport once it
+            // has held up. Runs here, after the update, because both inputs are
+            // then current: feats_down_body is this scan, and state_point is
+            // the filter's best estimate of where it is in its OWN frame,
+            // tracked against its own live map.
+            verify_and_apply_lock();
+
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
@@ -1484,8 +1617,217 @@ private:
     // Shared by /relocalize and the auto-triggered path in health_check_callback:
     // drop the odometry trail (it indexes scans from the OLD search) and stand
     // the current lock down so global_localization_thread starts over.
+    // Counts a lock that was CLAIMED and then LOST, and past
+    // max_relock_attempts_ halts the automatic search entirely.
+    //
+    // Only real losses count. A candidate rejected during verification never
+    // became a lock and cost nothing -- the filter kept tracking on its own
+    // map throughout -- and rejections are routine (MEASURED: 3 in a row
+    // before a good one), so counting those would halt almost immediately.
+    // Call BEFORE rearm_search() so the halt lands on the same cycle that
+    // would otherwise start hunting again.
+    void record_relock_attempt()
+    {
+        relock_attempts_++;
+        if (max_relock_attempts_ > 0 && relock_attempts_ >= max_relock_attempts_) {
+            {
+                std::lock_guard<std::mutex> lk(init_state_mutex);
+                search_halted = true;
+            }
+            RCLCPP_ERROR(this->get_logger(),
+                "[health] %d locks claimed and lost in a row -- giving up on the "
+                "automatic search. This place is aliasing badly enough that "
+                "retrying just finds it again. SET THE POSE MANUALLY: use RViz's "
+                "2D Pose Estimate (/initialpose), or call /relocalize to force "
+                "another search.", relock_attempts_);
+            publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::ERROR,
+                "Search halted; waiting for a manual /initialpose");
+        }
+    }
+
+    /*** Score a pending ScanContext lock against the LIVE scan, and apply it
+     *** only once it has passed lock_verify_scans_ times in a row.
+     ***
+     *** Nothing here touches the filter until the candidate has earned it. The
+     *** old code teleported and swapped in the prior map the instant the
+     *** search announced a lock, which is a one-way bet placed before the
+     *** evidence is in: if the candidate was wrong, the filter lost the live
+     *** map it was successfully tracking against (map_incremental stops at the
+     *** swap) and gained one it could not match from that pose. With no
+     *** correspondences the iEKF applies no update at all -- h_share_model
+     *** rejects every point whose 5th-nearest map point is beyond ~2.24 m --
+     *** so the state ran open-loop on IMU and accelerated away even standing
+     *** still. MEASURED: a lock whose two estimates agreed to 0.17 m scored
+     *** 91% overlap at its own scan and 0-3% live, then produced 5558
+     *** consecutive "No Effective Points" and unbounded drift.
+     ***
+     *** Rejecting is cheap precisely because nothing was given up: the filter
+     *** keeps tracking on its own map throughout, so a bad candidate costs one
+     *** re-arm and no pose. ***/
+    void verify_and_apply_lock()
+    {
+        int id = -1;
+        Eigen::Matrix4d T_cand = Eigen::Matrix4d::Identity();
+        bool locked = false;
+        {
+            // The search thread writes init_result and sets
+            // global_localization_finish under this mutex, so both are read
+            // under it here.
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            locked = global_localization_finish;
+            if (locked) { id = init_result.first; T_cand = init_result.second; }
+        }
+        if (!locked || global_update) return;
+        if (feats_down_body->empty()) return;
+
+        // A re-arm clears the trail and restarts ids at 0, so an id from
+        // before it must not index the new one.
+        Eigen::Matrix4d T_odom_lock;
+        if (!odom_at(id, T_odom_lock)) {
+            RCLCPP_WARN(this->get_logger(),
+                "[init] lock references trail entry %d but the trail was "
+                "re-armed underneath it; discarding.", id);
+            rearm_search();
+            return;
+        }
+
+        Eigen::Matrix4d T_odom_now = Eigen::Matrix4d::Identity();
+        T_odom_now.block<3,3>(0,0) = state_point.rot.toRotationMatrix();
+        T_odom_now.block<3,1>(0,3) = state_point.pos;
+
+        // Where the candidate says we are NOW, carried forward through the
+        // odometry accumulated since its scan. Re-derived every scan, so each
+        // check is against a fresh observation rather than the one that
+        // produced the candidate.
+        const Eigen::Matrix4d T_map_now =
+            T_cand * T_odom_lock.inverse() * T_odom_now;
+
+        Eigen::Matrix4d T_i_l = Eigen::Matrix4d::Identity();
+        T_i_l.block<3,3>(0,0) = state_point.offset_R_L_I.toRotationMatrix();
+        T_i_l.block<3,1>(0,3) = state_point.offset_T_L_I;
+
+        const Eigen::Matrix4d T_map_lidar = T_map_now * T_i_l;
+
+        // Show what is being tested, BEFORE deciding, so a rejected candidate
+        // is still seen. Republished every check, so the candidate visibly
+        // hops as places are tried.
+        {
+            geometry_msgs::msg::PoseStamped cp;
+            cp.header.stamp = get_ros_time(lidar_end_time);
+            cp.header.frame_id = map_frame;
+            const Eigen::Quaterniond q(M3D(T_map_now.block<3,3>(0,0)));
+            cp.pose.position.x = T_map_now(0,3);
+            cp.pose.position.y = T_map_now(1,3);
+            cp.pose.position.z = T_map_now(2,3);
+            cp.pose.orientation.w = q.w(); cp.pose.orientation.x = q.x();
+            cp.pose.orientation.y = q.y(); cp.pose.orientation.z = q.z();
+            pubCandidatePose_->publish(cp);
+
+            PointCloudXYZI::Ptr at_cand(new PointCloudXYZI());
+            pcl::transformPointCloud(*feats_down_body, *at_cand,
+                                     T_map_lidar.cast<float>());
+            sensor_msgs::msg::PointCloud2 cs;
+            pcl::toROSMsg(*at_cand, cs);
+            cs.header.stamp = cp.header.stamp;
+            cs.header.frame_id = map_frame;
+            pubCandidateScan_->publish(cs);
+        }
+
+        const double ov = map_overlap(feats_down_body, T_map_lidar);
+        if (ov < init_min_overlap) {
+            RCLCPP_WARN(this->get_logger(),
+                "[init] candidate REJECTED after %d/%d checks: only %.0f%% of "
+                "the live scan lands on the map at the pose it predicts (need "
+                "%.0f%%). The map was never swapped and the filter is still "
+                "tracking normally; searching again.",
+                lock_verify_passes_, lock_verify_scans_,
+                100.0 * ov, 100.0 * init_min_overlap);
+            reject_candidate();
+            return;
+        }
+
+        lock_verify_passes_++;
+        if (lock_verify_passes_ < lock_verify_scans_) {
+            RCLCPP_INFO(this->get_logger(),
+                "[init] verifying candidate: %d/%d at %.0f%% overlap",
+                lock_verify_passes_, lock_verify_scans_, 100.0 * ov);
+            return;
+        }
+
+        // Verified. Apply it.
+        //
+        // The handover is a change of WORLD FRAME, not just a pose edit, so
+        // every world-frame quantity has to rotate with it -- not only
+        // pos/rot. Upstream sets pos and rot alone, which is only safe when
+        // the map and LIO start frames nearly coincide. This map is levelled
+        // ~90 deg off the LIO start attitude, so leaving grav behind points
+        // gravity sideways in the new frame and the filter diverges within a
+        // few scans.
+        const M3D R_old = state_point.rot.toRotationMatrix();
+        const M3D R_new = T_map_now.block<3,3>(0,0);
+        const M3D R_delta = R_new * R_old.transpose();
+
+        state_ikfom gs = state_point;
+        gs.pos  = T_map_now.block<3,1>(0,3);
+        gs.rot  = R_new;
+        gs.vel  = R_delta * state_point.vel;      // world-frame velocity
+        gs.grav = S2(V3D(R_delta * state_point.grav.vec));
+        // bg/ba are body-frame biases and offset_R/T_L_I is the lidar-IMU
+        // extrinsic; none are world-frame.
+        kf.change_x(gs);
+        // A lock is still a jump the filter did not measure. change_x() alone
+        // keeps P at the pre-jump track's confidence, so the filter resists
+        // the map correcting the remaining error. Open pos and rot the way the
+        // /initialpose path does and let the next scans pull it in.
+        {
+            auto P = kf.get_P();
+            P.block<3, 3>(0, 0) = M3D::Identity() * seed_pos_cov_;
+            P.block<3, 3>(3, 3) = M3D::Identity() * seed_rot_cov_;
+            kf.change_P(P);
+        }
+        state_point = kf.get_x();
+
+        // Hand the filter the prior map. Shared, not moved: ikdtree_global
+        // keeps it for the next lock after a re-arm.
+        if (!map_swapped) {
+            ikdtree = ikdtree_global;
+            map_swapped = true;
+        }
+        global_update = true;
+        has_ever_locked_ = true;
+        lock_verify_passes_ = 0;
+
+        RCLCPP_INFO(this->get_logger(),
+            "Localized: filter is now in the map frame at "
+            "x=%.2f y=%.2f z=%.2f (verified over %d scans, %.0f%% overlap); "
+            "prior map is read-only from here.",
+            gs.pos(0), gs.pos(1), gs.pos(2), lock_verify_scans_, 100.0 * ov);
+    }
+
+    // A candidate failed VERIFICATION. Unlike rearm_search() this keeps the
+    // odometry trail and the queued scans: the candidate was never applied, so
+    // the filter never moved and the trail entries a later candidate indexes
+    // by id are all still valid. rearm_search() dropped them, which made every
+    // rejection cost a full rebuild of the trail and scan queue before the
+    // search could even resume -- the reason hunting through candidates felt
+    // slow. Only the candidate itself is discarded.
+    void reject_candidate()
+    {
+        lock_verify_passes_ = 0;
+        {
+            std::lock_guard<std::mutex> lk(candidate_mutex);
+            candidate_ids.clear();
+            candidate_poses.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lk(init_state_mutex);
+            global_localization_finish = false;   // search resumes immediately
+        }
+    }
+
     void rearm_search()
     {
+        lock_verify_passes_ = 0;
         {
             std::lock_guard<std::mutex> lk(init_feats_mutex);
             std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
@@ -1557,9 +1899,26 @@ private:
     void health_check_callback()
     {
         if (!map_loaded) return;
+        // Unlocked is TWO different situations and consumers act on them
+        // differently, so they must not share a level. Never yet localized is
+        // the normal startup state -- nothing has been lost and nothing is
+        // wrong, so WARN. Unlocked AFTER holding a lock means the pose was
+        // thrown away (health said it was wrong, or /relocalize was called):
+        // there is no map -> base_footprint edge at all until the next lock,
+        // so anything navigating on it must STOP. That is ERROR.
+        //
+        // localization_watchdog treats only ERROR as lost by default
+        // (treat_warn_as_lost false), which is exactly right given this split:
+        // it holds navigation through a re-arm, but does not fire recovery at
+        // startup into a search that is already running.
         if (!global_update) {
-            publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::WARN,
-                                "Searching for initial pose (not yet localized)");
+            if (has_ever_locked_) {
+                publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::ERROR,
+                    "Lock lost; searching again -- no map pose is being published");
+            } else {
+                publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::WARN,
+                                    "Searching for initial pose (not yet localized)");
+            }
             return;
         }
         if (feats_down_body->empty()) return;
@@ -1592,19 +1951,26 @@ private:
             RCLCPP_WARN(this->get_logger(),
                 "[health] overlap %.0f%% (need %.0f%%), bad for %.1f s (limit %.1f)",
                 100.0 * ov, 100.0 * health_min_overlap_, bad_for, health_bad_duration_);
-            if (auto_relocalize_ && bad_for >= health_bad_duration_) {
+            // Sustained, not momentary: escalate to ERROR so an operator sees
+            // it, but do NOT act. This used to re-arm the search itself; that
+            // freed the filter from the map while the hunt restarted and the
+            // next handover carried the velocity from that unconstrained
+            // window in at full confidence, so repeated attempts compounded
+            // instead of converging. Recovery is now deliberate: /initialpose
+            // or /relocalize.
+            if (bad_for >= health_bad_duration_) {
                 RCLCPP_ERROR(this->get_logger(),
                     "[health] overlap stayed below %.0f%% for %.1f s -- this lock "
-                    "looks wrong. Re-arming the global search (auto_relocalize).",
+                    "looks wrong. Correct it with /initialpose, or call "
+                    "/relocalize to search again.",
                     100.0 * health_min_overlap_, bad_for);
                 publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::ERROR,
-                    "Lock looks wrong; auto-relocalize re-armed the search", ov_str);
-                rearm_search();
-                overlap_bad_ = false;
+                    "Lock looks wrong; waiting for /initialpose or /relocalize",
+                    ov_str);
                 return;
             }
             publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::WARN,
-                "Overlap below threshold; watching before acting", ov_str);
+                "Overlap below threshold; watching", ov_str);
         } else {
             overlap_bad_ = false;
             publish_diagnostic(diagnostic_msgs::msg::DiagnosticStatus::OK,
@@ -1642,6 +2008,7 @@ private:
 #endif
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
     std::thread init_thread_;
     rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubPriorMap_;
     sensor_msgs::msg::PointCloud2 prior_map_msg_;   // built once in on_configure, published in on_activate
@@ -1654,13 +2021,37 @@ private:
 
     // Post-lock health check (see health_check_callback).
     rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Float32>::SharedPtr pubLocalizationOverlap_;
+    rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pubCandidatePose_;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubCandidateScan_;
     rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pubDiagnostics_;
     rclcpp::TimerBase::SharedPtr health_timer_;
     double health_min_overlap_   = 0.45;
     double health_bad_duration_  = 5.0;
     double health_check_period_  = 1.0;
-    bool   auto_relocalize_      = true;
     bool   overlap_bad_          = false;
+    // Latched at the first handover and never cleared: it separates "still
+    // looking, never had a pose" from "had a pose and lost it". See the
+    // !global_update branch in health_check_callback.
+    bool   has_ever_locked_      = false;
+    // Consecutive live scans a pending lock has passed (verify_and_apply_lock).
+    // Reset by rearm_search and by any failed check -- the passes must be
+    // CONSECUTIVE, so one bad scan sends the candidate back to the search.
+    int    lock_verify_passes_   = 0;
+    int    lock_verify_scans_    = 3;
+    // Seconds of CONSECUTIVE effct_feat_num == 0 before the lock is dropped.
+    // Short by design -- see the zero-match guard in timer_callback.
+    double no_match_duration_    = 1.0;
+    bool   no_match_bad_         = false;
+    rclcpp::Time no_match_since_;
+    // Locks claimed and then lost in a row. Reset by /initialpose and
+    // /relocalize (an operator asking for another try gets a fresh budget).
+    int    relock_attempts_      = 0;
+    int    max_relock_attempts_  = 2;
+    // Metres/second the platform physically cannot exceed. A Pepper's drive
+    // tops out near 0.55 m/s; this is set well above that so it can never
+    // clip real motion, yet far below a diverging estimate. Only consulted
+    // while running open-loop (see the clamp in the zero-match guard).
+    double max_speed_            = 1.0;
     double seed_pos_cov_         = 0.5;
     double seed_rot_cov_         = 0.04;
     double last_overlap_         = 1.0;

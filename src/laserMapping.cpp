@@ -195,6 +195,10 @@ public:
         this->get_parameter_or<bool>("publish.publish_tf", publish_tf_en, true);
         this->get_parameter_or<string>("publish.map_frame", map_frame, "camera_init");
         this->get_parameter_or<string>("publish.body_frame", body_frame, "body");
+        // Mapping has no lock/handover: its world genuinely IS map_frame for
+        // the whole run, so this is set once and never revisited (unlike
+        // fastlio_localization, which mirrors it every scan).
+        world_pub_frame = map_frame;
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 

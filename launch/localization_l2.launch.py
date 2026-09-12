@@ -78,30 +78,49 @@ def generate_launch_description():
             description='ScanContext descriptor sector count.'),
         DeclareLaunchArgument('sc_lidar_height', default_value='0.5',
             description='Lidar height above ground, metres.'),
-        DeclareLaunchArgument('sc_dist_thres', default_value='0.15',
+        # Tightened from 0.15. This is the cosine distance below which
+        # ScanContext calls a descriptor a match; looser values put more
+        # candidates in front of ICP, and in self-similar geometry the extra
+        # ones are exactly the aliased wrong places.
+        DeclareLaunchArgument('sc_dist_thres', default_value='0.12',
             description='ScanContext match distance threshold.'),
         # A single ScanContext hit in a corridor is not evidence. Require this
         # many independent locks agreeing within init_agree_dist.
         DeclareLaunchArgument('init_agree_count', default_value='2',
             description='Independent ScanContext locks required to agree.'),
-        DeclareLaunchArgument('init_agree_dist', default_value='2.0',
+        # Tightened from 2.0: a lock was MEASURED passing at 1.96 m against the
+        # 2.00 m limit -- i.e. two estimates nearly 2 m apart counted as
+        # "agreeing", which is barely evidence at all. Raise it back if locking
+        # becomes unreliable in open space, but understand that loosening this
+        # is exactly what lets a wrong-but-plausible pair through.
+        DeclareLaunchArgument('init_agree_dist', default_value='1.0',
             description='Metres within which agreeing locks must match.'),
-        # Agreement alone can't catch two matches that agree on the SAME wrong
-        # place (MEASURED: 41 m off in a corridor). require_motion forces the
-        # two estimates apart in space so agreement means something; off by
-        # default since a seeded /initialpose start doesn't need it. Turn on
-        # for unattended startup with no seed.
-        DeclareLaunchArgument('init_require_motion', default_value='false',
-            description='Require motion between agreeing estimates before '
-                        'accepting a lock (guards against vacuous standstill '
-                        'agreement).'),
-        DeclareLaunchArgument('init_motion_min', default_value='0.50',
-            description='Metres of odometry required between the agreeing '
-                        'estimates. Only used when init_require_motion.'),
-        DeclareLaunchArgument('init_min_overlap', default_value='0.70',
+        DeclareLaunchArgument('lock_verify_scans', default_value='5',
+            description='Consecutive live scans a candidate must clear '
+                        'init_min_overlap on before the filter is teleported '
+                        'and the prior map swapped in. Until then nothing is '
+                        'committed and a bad candidate costs nothing.'),
+        DeclareLaunchArgument('max_relock_attempts', default_value='2',
+            description='Locks claimed and then lost before the automatic '
+                        'search gives up and waits for a manual /initialpose. '
+                        '0 retries forever.'),
+        DeclareLaunchArgument('max_speed', default_value='1.0',
+            description="Metres/second the platform cannot exceed (Pepper is "
+                        "~0.55). Used only to detect a diverging open-loop "
+                        "estimate and zero its velocity."),
+        # Raised from 0.70. Used twice: as the admission gate on a fresh
+        # registration, and as the per-scan bar during verification.
+        DeclareLaunchArgument('init_min_overlap', default_value='0.80',
             description='Minimum fraction of the scan that must overlap the '
                         'map at the proposed pose.'),
-        DeclareLaunchArgument('init_overlap_dist', default_value='0.20',
+        # Tightened from 0.20. This is the single most important number for
+        # not locking to the wrong place: it is the radius within which a scan
+        # point counts as "on the map". MEASURED at 0.20 in a corner, a pose
+        # the iEKF could not register against at all still scored 78-99%,
+        # because in a structured room a wrong pose still puts most points
+        # within 20 cm of SOMETHING. Note every overlap number drops when this
+        # tightens, health_min_overlap included.
+        DeclareLaunchArgument('init_overlap_dist', default_value='0.12',
             description='Metres. Keep TIGHT -- looser values let a wrong lock '
                         'still score a high overlap.'),
     ]
@@ -113,6 +132,20 @@ def generate_launch_description():
             os.path.join(share, 'config', 'l2_rsimu.yaml'),
             {'use_sim_time': LaunchConfiguration('use_sim_time'),
              'publish.map_frame': LaunchConfiguration('map_frame'),
+             # Both are TRUE in l2_rsimu.yaml because that file is shared with
+             # the MAPPING stack, where they are correct. In LOCALIZATION they
+             # are waste, so they are overridden here rather than in the config
+             # (which mapping still reads).
+             #   map_en: publish_map() accumulates every registered scan into
+             #     pcl_wait_pub (capped at 4M points) and republishes it every
+             #     second -- a SECOND cloud in RAM beside the 4.48M-point prior
+             #     map, built for nothing: this node does not map, and
+             #     pcd_save_en is false so it is never written.
+             #   effect_map_en: /cloud_effected every scan (~10 Hz). A real
+             #     diagnostic (utils/lio_health.py reads it), but debug-only
+             #     cost when nothing is watching.
+             'publish.map_en': False,
+             'publish.effect_map_en': False,
              # Explicit type: a bare LaunchConfiguration arrives as a string,
              # which the node's bool parameter rejects.
              'publish.publish_tf': ParameterValue(
@@ -128,11 +161,14 @@ def generate_launch_description():
              'localization.sc_dist_thres': LaunchConfiguration('sc_dist_thres'),
              'localization.init_agree_count': LaunchConfiguration('init_agree_count'),
              'localization.init_agree_dist': LaunchConfiguration('init_agree_dist'),
-             'localization.init_require_motion': ParameterValue(
-                 LaunchConfiguration('init_require_motion'), value_type=bool),
-             'localization.init_motion_min': LaunchConfiguration('init_motion_min'),
              'localization.init_min_overlap': LaunchConfiguration('init_min_overlap'),
-             'localization.init_overlap_dist': LaunchConfiguration('init_overlap_dist')},
+             'localization.init_overlap_dist': LaunchConfiguration('init_overlap_dist'),
+             'localization.lock_verify_scans': ParameterValue(
+                 LaunchConfiguration('lock_verify_scans'), value_type=int),
+             'localization.max_relock_attempts': ParameterValue(
+                 LaunchConfiguration('max_relock_attempts'), value_type=int),
+             'localization.max_speed': ParameterValue(
+                 LaunchConfiguration('max_speed'), value_type=float)},
         ])
 
     rviz = Node(

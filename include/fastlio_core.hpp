@@ -79,6 +79,25 @@ condition_variable sig_buffer;
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
 string map_frame, body_frame;
+// What publish_frame_world/publish_effect_world/publish_map/publish_path
+// actually stamp world-frame messages with.
+//
+// fastlio_mapping sets it to map_frame once and never changes it -- its world
+// IS map_frame for the whole run. fastlio_localization instead mirrors
+// /Odometry's own frame_id every scan (see publish_odometry): before a lock
+// the filter's "world" is its own mount-tilted native frame, and a cloud
+// claiming map_frame there renders under RViz's Fixed Frame with zero
+// correction, visibly rotated by the mount tilt -- MEASURED, and reported as
+// the point cloud "pointing up".
+string world_pub_frame;
+// When >= 0, publish_frame_world stamps EVERY point of the published cloud
+// with this intensity instead of the sensor's own. fastlio_localization uses
+// it to carry lock state into the visualization -- RViz colours a PointCloud2
+// by a channel, not by anything it can learn from a topic, so the state has to
+// travel inside the cloud. Set to lock_colour_unlocked/_locked; RViz maps the
+// range red -> green (see rviz/fastlio_localization.rviz). Left negative by
+// fastlio_mapping, which publishes true intensity.
+float world_pub_intensity = -1.0f;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -502,13 +521,15 @@ void publish_frame_world(PubCloudT pubLaserCloudFull)
         {
             RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                                 &laserCloudWorld->points[i]);
+            if (world_pub_intensity >= 0.0f)
+                laserCloudWorld->points[i].intensity = world_pub_intensity;
         }
 
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = map_frame;
+        laserCloudmsg.header.frame_id = world_pub_frame;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -579,7 +600,7 @@ void publish_effect_world(PubCloudT pubLaserCloudEffect)
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = map_frame;
+    laserCloudFullRes3.header.frame_id = world_pub_frame;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -622,7 +643,7 @@ void publish_map(PubCloudT pubLaserCloudMap)
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = map_frame;
+    laserCloudmsg.header.frame_id = world_pub_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
 }
 
@@ -650,7 +671,7 @@ void publish_path(PubPathT pubPath)
 {
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = map_frame;
+    msg_body_pose.header.frame_id = world_pub_frame;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
