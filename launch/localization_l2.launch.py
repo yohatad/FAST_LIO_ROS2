@@ -108,9 +108,15 @@ def generate_launch_description():
             description="Metres/second the platform cannot exceed (Pepper is "
                         "~0.55). Used only to detect a diverging open-loop "
                         "estimate and zero its velocity."),
-        # Raised from 0.70. Used twice: as the admission gate on a fresh
-        # registration, and as the per-scan bar during verification.
-        DeclareLaunchArgument('init_min_overlap', default_value='0.80',
+        # Used twice: as the admission gate on a fresh registration, and as
+        # the per-scan bar during verification.
+        #
+        # Kept at 0.70 even though init_overlap_dist was tightened. Raising
+        # this to 0.80 at the same time double-counted the tightening -- a
+        # smaller radius already drops EVERY score, correct poses included --
+        # and starved the search: candidates landed repeatedly in the 75-80%
+        # band and nothing ever locked. VERIFIED on the robot at 0.70.
+        DeclareLaunchArgument('init_min_overlap', default_value='0.70',
             description='Minimum fraction of the scan that must overlap the '
                         'map at the proposed pose.'),
         # Tightened from 0.20. This is the single most important number for
