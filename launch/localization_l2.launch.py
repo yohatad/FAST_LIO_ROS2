@@ -18,7 +18,7 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
@@ -135,7 +135,9 @@ def generate_launch_description():
         package='fast_lio', executable='fastlio_localization',
         name='fast_lio_localization', output='screen',
         parameters=[
-            os.path.join(share, 'config', 'l2_rsimu.yaml'),
+            # config_file, not a hardcoded name: the argument was declared and
+            # then ignored, so passing it silently did nothing.
+            PathJoinSubstitution([share, 'config', LaunchConfiguration('config_file')]),
             {'use_sim_time': LaunchConfiguration('use_sim_time'),
              'publish.map_frame': LaunchConfiguration('map_frame'),
              # Both are TRUE in l2_rsimu.yaml because that file is shared with
