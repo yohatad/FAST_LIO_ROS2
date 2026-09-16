@@ -33,6 +33,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include "fastlio_core.hpp"
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <mutex>
 
 // Everything the two nodes share -- estimator globals, callbacks, the
 // ikd-Tree map, h_share_model and the cloud/path publishers -- lives in
@@ -130,6 +132,16 @@ public:
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
+        // Zero-velocity update from wheel odometry: when the wheels report the
+        // base stationary and the gyro agrees, feed v = 0 to the filter so a
+        // scan with no usable correspondences cannot double-integrate the
+        // accelerometer bias into a runaway. Off unless wheel.topic is set.
+        this->declare_parameter<string>("wheel.topic", "");
+        this->declare_parameter<bool>("wheel.zupt_en", true);
+        this->declare_parameter<double>("wheel.zupt_speed_thresh", 0.02);   // m/s, wheel-reported
+        this->declare_parameter<double>("wheel.zupt_gyro_thresh", 0.03);    // rad/s, bias-corrected IMU
+        this->declare_parameter<double>("wheel.zupt_sigma", 0.02);          // m/s, measurement noise of v = 0
+        this->declare_parameter<double>("wheel.max_age", 0.15);             // s, wheel sample must bracket the scan this closely
         this->declare_parameter<double>("filter_size_corner", 0.5);
         this->declare_parameter<double>("filter_size_surf", 0.5);
         this->declare_parameter<double>("filter_size_map", 0.5);
@@ -169,6 +181,12 @@ public:
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+        this->get_parameter_or<string>("wheel.topic", wheel_topic_, "");
+        this->get_parameter_or<bool>("wheel.zupt_en", zupt_en_, true);
+        this->get_parameter_or<double>("wheel.zupt_speed_thresh", zupt_speed_thresh_, 0.02);
+        this->get_parameter_or<double>("wheel.zupt_gyro_thresh", zupt_gyro_thresh_, 0.03);
+        this->get_parameter_or<double>("wheel.zupt_sigma", zupt_sigma_, 0.02);
+        this->get_parameter_or<double>("wheel.max_age", wheel_max_age_, 0.15);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
         this->get_parameter_or<double>("filter_size_surf",filter_size_surf_min,0.5);
         this->get_parameter_or<double>("filter_size_map",filter_size_map_min,0.5);
@@ -285,6 +303,22 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        // [lambda_min, lambda_mid, lambda_max, dir_x, dir_y, dir_z (world), effective points, zupt applied (0/1)]
+        pubDegeneracy_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("/lio/degeneracy", 20);
+        if (!wheel_topic_.empty())
+        {
+            sub_wheel_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                wheel_topic_, rclcpp::SensorDataQoS().keep_last(100),
+                [this](const nav_msgs::msg::Odometry::SharedPtr m) {
+                    const auto &l = m->twist.twist.linear;
+                    std::lock_guard<std::mutex> lk(wheel_mtx_);
+                    wheel_buf_.emplace_back(rclcpp::Time(m->header.stamp).seconds(),
+                                            std::hypot(l.x, l.y), std::fabs(m->twist.twist.angular.z));
+                    while (wheel_buf_.size() > 400) wheel_buf_.pop_front();
+                });
+            RCLCPP_INFO(this->get_logger(), "wheel ZUPT %s: topic %s, speed < %.3f m/s, gyro < %.3f rad/s, sigma %.3f m/s",
+                        zupt_en_ ? "enabled" : "disabled", wheel_topic_.c_str(), zupt_speed_thresh_, zupt_gyro_thresh_, zupt_sigma_);
+        }
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -402,7 +436,9 @@ private:
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            const bool zupt_applied = apply_wheel_zupt();
             state_point = kf.get_x();
+            publish_degeneracy(zupt_applied);
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
@@ -487,6 +523,64 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pubDegeneracy_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_wheel_;
+    std::mutex wheel_mtx_;
+    std::deque<std::tuple<double, double, double>> wheel_buf_;   // stamp, |v_xy|, |w_z|
+    string wheel_topic_;
+    bool zupt_en_ = true;
+    double zupt_speed_thresh_ = 0.02, zupt_gyro_thresh_ = 0.03, zupt_sigma_ = 0.02, wheel_max_age_ = 0.15;
+    int zupt_count_ = 0;
+
+    // True when the wheel sample nearest to lidar_end_time (within max_age)
+    // reports the base stationary.
+    bool wheel_stationary()
+    {
+        std::lock_guard<std::mutex> lk(wheel_mtx_);
+        double best_dt = 1e9, v = 0, w = 0;
+        for (const auto &s : wheel_buf_)
+        {
+            double dt = std::fabs(std::get<0>(s) - lidar_end_time);
+            if (dt < best_dt) { best_dt = dt; v = std::get<1>(s); w = std::get<2>(s); }
+        }
+        return best_dt <= wheel_max_age_ && v < zupt_speed_thresh_ && w < zupt_speed_thresh_ * 5.0;
+    }
+
+    // Zero-velocity measurement update on the filter state: h(x) = vel (world
+    // frame), z = 0. Only the vel block of H is non-zero, so K = P[:,vel] S^-1.
+    // Applied after the LiDAR update; when the scan constrained the state the
+    // velocity is already ~0 and the update is a no-op, when it did not this
+    // is what keeps the bias from being double-integrated into position.
+    bool apply_wheel_zupt()
+    {
+        if (!zupt_en_ || wheel_topic_.empty() || !flg_EKF_inited) return false;
+        if (!wheel_stationary()) return false;
+        state_ikfom x = kf.get_x();
+        const V3D gyro = p_imu->get_angvel_last();          // bias-corrected
+        if (gyro.norm() > zupt_gyro_thresh_) return false;  // wheels idle but body turning: do not trust
+        constexpr int VEL = 12;                              // tangent index of vel in state_ikfom
+        Eigen::Matrix<double, 23, 23> P = kf.get_P();
+        Eigen::Matrix<double, 3, 3> S = P.block<3, 3>(VEL, VEL) + zupt_sigma_ * zupt_sigma_ * M3D::Identity();
+        Eigen::Matrix<double, 23, 3> K = P.block<23, 3>(0, VEL) * S.inverse();
+        const double v_before = x.vel.norm();
+        Eigen::Matrix<double, 23, 1> dx = K * (-x.vel);
+        x.boxplus(dx);
+        Eigen::Matrix<double, 23, 23> IKH = Eigen::Matrix<double, 23, 23>::Identity();
+        IKH.block<23, 3>(0, VEL) -= K;
+        P = IKH * P;
+        kf.change_x(x); kf.change_P(P);
+        if (++zupt_count_ % 50 == 1)
+            RCLCPP_INFO(this->get_logger(), "wheel ZUPT applied (%d so far), |v| before %.3f m/s", zupt_count_, v_before);
+        return true;
+    }
+
+    void publish_degeneracy(bool zupt_applied)
+    {
+        std_msgs::msg::Float64MultiArray m;
+        m.data = {degen_eig[0], degen_eig[1], degen_eig[2], degen_dir[0], degen_dir[1], degen_dir[2],
+                  double(effct_feat_num), zupt_applied ? 1.0 : 0.0};
+        pubDegeneracy_->publish(m);
+    }
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
 #ifdef HAVE_LIVOX

@@ -100,6 +100,12 @@ string world_pub_frame;
 float world_pub_intensity = -1.0f;
 
 double res_mean_last = 0.05, total_residual = 0.0;
+// LiDAR degeneracy indicator (Zhang & Singh 2016): eigen-decomposition of the
+// translation block of H^T H, i.e. sum of n n^T over the effective plane
+// normals (world frame). degen_eig is ascending; degen_dir is the eigenvector
+// of the smallest eigenvalue -- the direction the scan constrains least.
+// Refreshed by h_share_model, read by the mapping node after each update.
+V3D    degen_eig = Zero3d, degen_dir = Zero3d;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
@@ -768,6 +774,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
     ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
     ekfom_data.h.resize(effct_feat_num);
+    M3D nnT = M3D::Zero();
 
     for (int i = 0; i < effct_feat_num; i++)
     {
@@ -782,6 +789,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** get the normal vector of closest surface/corner ***/
         const PointType &norm_p = corr_normvect->points[i];
         V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
+        nnT += norm_vec * norm_vec.transpose();
 
         /*** calculate the Measuremnt Jacobian matrix H ***/
         V3D C(s.rot.conjugate() *norm_vec);
@@ -798,6 +806,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
+    }
+    {
+        Eigen::SelfAdjointEigenSolver<M3D> es(nnT);
+        degen_eig = es.eigenvalues();            // ascending
+        degen_dir = es.eigenvectors().col(0);
     }
     solve_time += omp_get_wtime() - solve_start_;
 }
