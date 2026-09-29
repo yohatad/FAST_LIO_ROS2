@@ -108,6 +108,14 @@
             scan_publish_en:  true
             dense_publish_en: false
             scan_bodyframe_pub_en: true
+            # TEST_PLAN_map_odom.md diagnostic: default 0.05s TF lookup
+            # timeout for the odom -> base_footprint sample at the scan stamp
+            # caused a growing series of "map -> odom step ... held" warnings
+            # on slam_20260823_aligned bag replay, right after the initial
+            # lock (naoqi host-time skew on /pepper_odom is the suspected
+            # cause). Widen it per the plan's own suggestion; revert if this
+            # doesn't help.
+            odom_lookup_timeout: 0.1
             # Mapping / odometry values. lio_odom_bridge owns lio_init ->
             # base_footprint and requires FAST-LIO's own TF broadcast OFF with
             # the odometry in lio_init (see its docstring). With true / "map",
