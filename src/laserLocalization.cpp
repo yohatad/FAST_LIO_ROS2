@@ -31,6 +31,7 @@
 #include <queue>
 
 #include "fastlio_core.hpp"
+#include "map_odom.hpp"
 
 // The estimator core -- globals, sensor callbacks, scan/IMU sync, the
 // ikd-Tree local map, h_share_model, and the cloud/path publishers -- is
@@ -143,6 +144,12 @@ std::string tf_child_frame;                             // "" => broadcast body_
 bool        tf_child_resolved = false;                  // the static extrinsic below is cached
 M3D         R_body_to_tfchild(Eye3d);
 V3D         t_body_to_tfchild(0, 0, 0);
+
+/* --- map -> odom (REP-105), opt-in via publish.odom_frame ---
+   See map_odom.hpp. Off by default: the legacy map -> base_footprint edge
+   is unchanged until a launch file sets odom_frame. */
+map_odom::Params map_odom_params;
+map_odom::Gate   map_odom_gate;
 
 /* --- node-scope handles, set in on_configure() --- */
 std::shared_ptr<tf2_ros::Buffer>             tf_buffer_g;
@@ -288,7 +295,14 @@ void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::
     // publish_tf governs the TF broadcast only. /localization/pose used to sit
     // inside the same block, so publish_tf:=false silently removed the topic
     // bt_navigator takes its odometry from.
-    if (publish_tf_en) tf_br->sendTransform(trans);
+    if (publish_tf_en) {
+        if (map_odom_params.odom_frame.empty()) {
+            tf_br->sendTransform(trans);
+        } else if (tf_buffer_g) {
+            map_odom::publish(trans, map_odom_params, map_odom_gate, *tf_buffer_g,
+                              *tf_br, lio_logger(), lio_clock());
+        }
+    }
 
     // /localization/pose -- the SAME pose and twist, but genuinely in
     // tf_child_frame (base_footprint), matching the TF edge above.
@@ -771,6 +785,27 @@ public:
         this->get_parameter("localization.seed_rot_cov", seed_rot_cov_);
         this->declare_parameter<std::string>("publish.tf_child_frame", "base_footprint");
         this->get_parameter("publish.tf_child_frame", tf_child_frame);
+        // map -> odom instead of map -> tf_child_frame; see map_odom.hpp.
+        this->declare_parameter<std::string>("publish.odom_frame", "");
+        this->declare_parameter<bool>("publish.odom_planar", true);
+        this->declare_parameter<double>("publish.odom_lookup_timeout", 0.05);
+        this->declare_parameter<double>("publish.odom_future_dating", 0.2);
+        this->declare_parameter<double>("publish.odom_max_step_lin", 0.30);
+        this->declare_parameter<double>("publish.odom_max_step_ang", 0.175);
+        this->declare_parameter<double>("publish.odom_max_hold", 2.0);
+        this->get_parameter("publish.odom_frame", map_odom_params.odom_frame);
+        this->get_parameter("publish.odom_planar", map_odom_params.planar);
+        this->get_parameter("publish.odom_lookup_timeout", map_odom_params.lookup_timeout);
+        this->get_parameter("publish.odom_future_dating", map_odom_params.future_dating);
+        this->get_parameter("publish.odom_max_step_lin", map_odom_params.max_step_lin);
+        this->get_parameter("publish.odom_max_step_ang", map_odom_params.max_step_ang);
+        this->get_parameter("publish.odom_max_hold", map_odom_params.max_hold);
+        if (!map_odom_params.odom_frame.empty()) {
+            RCLCPP_INFO(this->get_logger(),
+                "Publishing %s -> %s (REP-105); %s -> %s must come from "
+                "wheel_odom_tf", map_frame.c_str(), map_odom_params.odom_frame.c_str(),
+                map_odom_params.odom_frame.c_str(), tf_child_frame.c_str());
+        }
         // Point the shared core's logger/clock at this node, so warnings from
         // fastlio_core.hpp carry the node name and can be throttled.
         lio_logger_ = this->get_logger();
@@ -1301,6 +1336,7 @@ private:
                 Localmap_Initialized = false;   // re-centre the local-map cube
                 global_update = true;
                 has_ever_locked_ = true;
+                map_odom_gate.reset();   // a deliberate move, not a glitch
                 RCLCPP_INFO(this->get_logger(),
                     "Seeded from /initialpose: filter is now at x=%.2f y=%.2f "
                     "z=%.2f; previous map discarded, prior map in use.",
@@ -1796,6 +1832,7 @@ private:
         global_update = true;
         has_ever_locked_ = true;
         lock_verify_passes_ = 0;
+        map_odom_gate.reset();   // a deliberate move, not a glitch
 
         RCLCPP_INFO(this->get_logger(),
             "Localized: filter is now in the map frame at "

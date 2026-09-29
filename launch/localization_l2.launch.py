@@ -64,6 +64,11 @@ def generate_launch_description():
         DeclareLaunchArgument('tf_child_frame', default_value='base_footprint',
             description='Child of the broadcast map edge. The body->child '
                         'extrinsic is read from /tf_static once and cached.'),
+        DeclareLaunchArgument('odom_frame', default_value='',
+            description='Empty (default): broadcast map -> tf_child_frame. '
+                        'Set to "odom" to broadcast map -> odom instead '
+                        '(REP-105); odom -> tf_child_frame must then come from '
+                        'pepper_slam wheel_odom_tf.py.'),
         DeclareLaunchArgument('publish_tf', default_value='true',
             description='Broadcast map -> body. Required standalone; turn off '
                         'if another node owns those frames.'),
@@ -159,6 +164,8 @@ def generate_launch_description():
              'publish.publish_tf': ParameterValue(
                  LaunchConfiguration('publish_tf'), value_type=bool),
              'publish.tf_child_frame': LaunchConfiguration('tf_child_frame'),
+             'publish.odom_frame': ParameterValue(
+                 LaunchConfiguration('odom_frame'), value_type=str),
              'localization.map_dir': LaunchConfiguration('map_dir'),
              'localization.map_scan_dir': LaunchConfiguration('map_scan_dir'),
              'localization.map_pose_file': LaunchConfiguration('map_pose_file'),
