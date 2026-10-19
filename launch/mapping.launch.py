@@ -41,7 +41,7 @@ def generate_launch_description():
     )
     declare_config_file_cmd = DeclareLaunchArgument(
         'config_file',
-        description='Config file (e.g. l2.yaml, mid360.yaml) -- required, no '
+        description='Config file (e.g. l2_rsimu.yaml, mid360.yaml) -- required, no '
                      'default: this launch file serves many different '
                      'sensors, and silently defaulting to one would load the '
                      'wrong config for everyone else. The bridge in\n'
