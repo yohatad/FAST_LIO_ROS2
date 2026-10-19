@@ -313,10 +313,17 @@ void publish_odometry(const rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::
         nav_msgs::msg::Odometry loc;
         loc.header = odomAftMapped.header;
         loc.child_frame_id = trans.child_frame_id;
-        loc.pose.pose.position.x = trans.transform.translation.x;
-        loc.pose.pose.position.y = trans.transform.translation.y;
-        loc.pose.pose.position.z = trans.transform.translation.z;
-        loc.pose.pose.orientation = trans.transform.rotation;
+        // In odom mode TF carries the FLATTENED pose (roll/pitch dropped, since
+        // planar wheel odometry cannot represent them). Flatten here too, or the
+        // topic and the tree disagree on attitude for the same edge.
+        geometry_msgs::msg::Transform pose_tf = trans.transform;
+        if (!map_odom_params.odom_frame.empty() && map_odom_params.planar) {
+            pose_tf = map_odom::to_msg(map_odom::flatten(map_odom::to_iso(pose_tf)));
+        }
+        loc.pose.pose.position.x = pose_tf.translation.x;
+        loc.pose.pose.position.y = pose_tf.translation.y;
+        loc.pose.pose.position.z = pose_tf.translation.z;
+        loc.pose.pose.orientation = pose_tf.rotation;
         loc.pose.covariance = odomAftMapped.pose.covariance;
         // Twist is in child_frame_id, so the base origin's offset from the
         // body origin adds a lever-arm term:
