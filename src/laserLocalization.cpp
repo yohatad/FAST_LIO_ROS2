@@ -795,7 +795,11 @@ public:
         // map -> odom instead of map -> tf_child_frame; see map_odom.hpp.
         this->declare_parameter<std::string>("publish.odom_frame", "");
         this->declare_parameter<bool>("publish.odom_planar", true);
-        this->declare_parameter<double>("publish.odom_lookup_timeout", 0.05);
+        this->declare_parameter<double>("publish.odom_lookup_timeout",
+                                        map_odom_params.lookup_timeout);
+        // s the gate status stays ERROR after a forced adopt; 0 = report-only.
+        this->declare_parameter<double>("publish.odom_gate_error_latch",
+                                        map_odom_params.error_latch);
         this->declare_parameter<double>("publish.odom_future_dating", 0.2);
         this->declare_parameter<double>("publish.odom_max_step_lin", 0.30);
         this->declare_parameter<double>("publish.odom_max_step_ang", 0.175);
@@ -803,6 +807,7 @@ public:
         this->get_parameter("publish.odom_frame", map_odom_params.odom_frame);
         this->get_parameter("publish.odom_planar", map_odom_params.planar);
         this->get_parameter("publish.odom_lookup_timeout", map_odom_params.lookup_timeout);
+        this->get_parameter("publish.odom_gate_error_latch", map_odom_params.error_latch);
         this->get_parameter("publish.odom_future_dating", map_odom_params.future_dating);
         this->get_parameter("publish.odom_max_step_lin", map_odom_params.max_step_lin);
         this->get_parameter("publish.odom_max_step_ang", map_odom_params.max_step_ang);
@@ -1937,6 +1942,14 @@ private:
         diagnostic_msgs::msg::DiagnosticArray arr;
         arr.header.stamp = this->get_clock()->now();
         arr.status.push_back(status);
+        // The map -> odom gate rides along, so one watchdog sees both. Only in
+        // odom mode: a permanently-OK status for an inactive feature is noise.
+        if (!map_odom_params.odom_frame.empty()) {
+            arr.status.push_back(map_odom::gate_status(
+                map_odom_gate, rclcpp::Time(arr.header.stamp).seconds(),
+                map_odom_params, "fastlio_localization: map -> odom gate",
+                "fast_lio_localization"));
+        }
         pubDiagnostics_->publish(arr);
     }
 
