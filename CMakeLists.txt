@@ -174,9 +174,9 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
-# NOTE: the Pepper bridge/filter scripts (lio_odom_bridge.py,
-# pgo_map_odom_bridge.py, cloud_range_filter.py) moved to
-# pepper_slam/scripts. They were never upstream FAST-LIO code, and
+# NOTE: the Pepper bridge/filter nodes (lio_odom_bridge,
+# pgo_map_odom_bridge, cloud_range_filter) moved to pepper_slam, where they
+# are now C++. They were never upstream FAST-LIO code, and
 # keeping them here made point_lio, fastlio_lc_pgo, FAST-LIVO2 and
 # pepper_navigation run executables out of fast_lio without declaring a
 # dependency on it.

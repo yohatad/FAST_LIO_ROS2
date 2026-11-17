@@ -78,7 +78,7 @@
             extrinsic_est_en:  false
             # Lidar origin expressed in the RealSense IMU frame, i.e.
             # p_camera_imu = extrinsic_R * p_l2lidar + extrinsic_T.
-            # Composed from pepper_slam/config/sensor_tf.yaml
+            # Composed from pepper_slam/data/sensor_tf.yaml
             #   l2lidar_frame -> camera_camera_link
             #     xyz [0.038541, -0.036473, 0.021032]
             #     quat [0.674794, -0.166617, 0.703353, 0.148951]   (rotation
