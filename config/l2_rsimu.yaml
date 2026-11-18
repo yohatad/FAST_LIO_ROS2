@@ -1,6 +1,9 @@
 # FAST-LIO for the Unitree L2 lidar driven by the REALSENSE IMU (/camera/imu)
-# instead of the L2's own (/imu/data).  A/B partner to l2.yaml -- everything not
-# mentioned below is identical to it, so read that file for the shared rationale.
+# instead of the L2's own (/imu/data). It is the only L2 config: its A/B
+# partner l2.yaml, which drove FAST-LIO from the L2's IMU, was removed in
+# 78a8d0c after it diverged on slam_20260823_aligned. Comments below that
+# compare against l2.yaml mean that file; `git show 78a8d0c^:config/l2.yaml`
+# has it, with the shared rationale for the settings not explained here.
 #
 # WHY. Measured on bag/slam_august_8_bag with utils/imu_crosscheck.py: the L2
 # gyro reports ~0 rad/s while the platform is genuinely rotating, for 29.7% of
@@ -12,8 +15,9 @@
 # The RealSense is rigidly attached to the L2 and is clean on the same bag:
 # 200 Hz, dt max 11 ms, zero gaps > 3x median, no saturation.
 #
-# STATUS: UNVALIDATED. This config has not yet been run. Compare against
-# l2.yaml on the same bag before adopting it.
+# STATUS: in use by every pepper4dec FAST-LIO launch since 78a8d0c. On
+# slam_20260823_aligned (odom mode) it kept map overlap at 1.00 with no health
+# warnings, where l2.yaml fell to 0.29.
 
 /**:
     ros__parameters:
@@ -44,7 +48,7 @@
         preprocess:
             lidar_type: 5
             scan_line:  1
-            blind: 0.1                   # see l2.yaml -- gates on the `range`
+            blind: 0.1                   # as in l2.yaml -- gates on the `range`
                                          # field, which is calibrated metres
                                          # since the l2lidar_node fix
             timestamp_unit: 0
